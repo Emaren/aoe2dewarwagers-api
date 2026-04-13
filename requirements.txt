@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+watchdog
+python-dotenv
+construct==2.8.16
+mgz==1.8.27
+asyncpg
+SQLAlchemy[asyncio]
+aiofiles
+alembic
+psycopg[binary]
+python-multipart
