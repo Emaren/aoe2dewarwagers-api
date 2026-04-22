@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query, Header, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from db.db import get_db
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 from typing import Optional, Tuple
@@ -78,7 +78,10 @@ def _safe_iso_datetime(value: str | None):
 
     try:
         normalized = value.replace("Z", "+00:00")
-        return datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
     except ValueError:
         return None
 
