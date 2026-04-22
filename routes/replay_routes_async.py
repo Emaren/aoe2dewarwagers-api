@@ -507,6 +507,12 @@ def _has_reliable_final_signal(parsed: dict, inferred_outcome: Optional[dict] = 
         if cleaned_winner and cleaned_winner != "Unknown":
             return True
 
+    player_source = str(key_events.get("player_extraction_source") or "").strip()
+    player_count = _coerce_positive_int(key_events.get("player_count"))
+    duration = _coerce_positive_int(parsed.get("duration") or parsed.get("game_duration"))
+    if player_source in {"header_fallback", "fast_header_fallback"} and player_count >= 2 and duration >= 60:
+        return True
+
     return False
 
 
@@ -986,6 +992,14 @@ async def upload_replay_file(
                 key_events = inferred_outcome["key_events"]
 
             if is_final_upload and not _has_reliable_final_signal(parsed, inferred_outcome):
+                logging.warning(
+                    "⚠️ final replay rejected as not ready: "
+                    f"winner={winner} completed={parsed.get('completed')} "
+                    f"players={len(players)} "
+                    f"player_source={key_events.get('player_extraction_source')} "
+                    f"player_error={key_events.get('player_extraction_error')} "
+                    f"parse_reason={parse_reason}"
+                )
                 await _record_parse_attempt(
                     db,
                     user_uid=uploader_uid,

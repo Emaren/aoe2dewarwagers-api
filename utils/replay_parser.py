@@ -8,6 +8,10 @@ import math
 import aiofiles
 import asyncio
 from mgz import header, summary
+try:
+    from mgz.fast.header import parse as fast_parse_header
+except Exception:
+    fast_parse_header = None
 from utils.extract_datetime import extract_datetime_from_filename
 
 CIVILIZATION_NAMES = {
@@ -166,6 +170,148 @@ def _normalize_position(value):
         cleaned.append(int(round(part)))
 
     return cleaned
+
+
+def _safe_summary_call(label, fn, default=None):
+    try:
+        return fn()
+    except Exception as exc:
+        logging.warning(f"⚠️ summary {label} failed: {exc}")
+        return default
+
+
+def _first_present(*values):
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _field(raw, *names):
+    values = []
+    for name in names:
+        if isinstance(raw, dict):
+            values.append(raw.get(name))
+        else:
+            values.append(getattr(raw, name, None))
+    return _first_present(*values)
+
+
+def _extract_header_player_shells(parsed_header):
+    candidates = []
+
+    for branch_name in ("de", "hd"):
+        branch = getattr(parsed_header, branch_name, None)
+        branch_players = getattr(branch, "players", None) if branch is not None else None
+        if branch_players:
+            candidates = list(branch_players)
+            break
+
+    if not candidates:
+        raw_players = getattr(parsed_header, "players", None)
+        if raw_players:
+            candidates = list(raw_players)
+
+    players = []
+    for raw in candidates:
+        number = _normalize_rating(_field(raw, "player_number", "number"))
+        if not number or number <= 0:
+            continue
+
+        name = str(_field(raw, "name", "player_name") or "").strip() or f"Player {number}"
+        civilization = _first_present(
+            _field(raw, "civilization", "civilization_id", "civil_id"),
+            "Unknown",
+        )
+        steam_id = _normalize_steam_id(_field(raw, "steam_id", "profile_id", "user_id"))
+        human_value = _field(raw, "human", "is_human")
+        prefer_random_value = _field(raw, "prefer_random")
+        cheater_value = _field(raw, "cheater")
+
+        players.append(
+            {
+                "name": name,
+                "number": number,
+                "civilization": civilization,
+                "winner": None,
+                "score": None,
+                "user_id": steam_id,
+                "steam_id": steam_id,
+                "steam_rm_rating": None,
+                "steam_dm_rating": None,
+                "rate_snapshot": None,
+                "eapm": None,
+                "position": None,
+                "color_id": _normalize_rating(_field(raw, "color_id", "color", "player_color")),
+                "team_id": _normalize_rating(_field(raw, "resolved_team_id", "team_id", "team")),
+                "human": bool(human_value) if human_value is not None else True,
+                "prefer_random": bool(prefer_random_value) if prefer_random_value is not None else None,
+                "mvp": None,
+                "cheater": bool(cheater_value) if cheater_value is not None else None,
+                "achievements": {},
+            }
+        )
+
+    return players
+
+
+def _extract_fast_header_player_shells(fast_header):
+    if not isinstance(fast_header, dict):
+        return []
+
+    raw_players = fast_header.get("players")
+    if not isinstance(raw_players, list):
+        return []
+
+    players = []
+    for index, raw in enumerate(raw_players, start=1):
+        if not isinstance(raw, dict):
+            continue
+
+        number = _normalize_rating(raw.get("number")) or _normalize_rating(raw.get("player_number")) or index
+        if not number or number <= 0:
+            continue
+
+        name = str(raw.get("name") or raw.get("player_name") or "").strip() or f"Player {number}"
+        civilization = _first_present(raw.get("civilization"), raw.get("civilization_id"), raw.get("civil_id"), "Unknown")
+        steam_id = _normalize_steam_id(_first_present(raw.get("steam_id"), raw.get("profile_id"), raw.get("user_id")))
+
+        players.append({
+            "name": name,
+            "number": number,
+            "civilization": civilization,
+            "winner": None,
+            "score": None,
+            "user_id": steam_id,
+            "steam_id": steam_id,
+            "steam_rm_rating": None,
+            "steam_dm_rating": None,
+            "rate_snapshot": None,
+            "eapm": None,
+            "position": None,
+            "color_id": _normalize_rating(_first_present(raw.get("color_id"), raw.get("color"), raw.get("player_color"))),
+            "team_id": _normalize_rating(_first_present(raw.get("resolved_team_id"), raw.get("team_id"), raw.get("team"))),
+            "human": True,
+            "prefer_random": None,
+            "mvp": None,
+            "cheater": None,
+            "achievements": {},
+        })
+
+    return players
+
+
+def _extract_fast_header_map(fast_header):
+    if not isinstance(fast_header, dict):
+        return {"name": "Unknown", "size": "Unknown"}
+
+    scenario = fast_header.get("scenario") if isinstance(fast_header.get("scenario"), dict) else {}
+    size = scenario.get("size") or scenario.get("dimension") or "Unknown"
+    map_name = scenario.get("map_name") or scenario.get("map") or scenario.get("map_id") or "Unknown"
+    return {"name": map_name, "size": size}
 
 
 def _has_meaningful_value(value):
@@ -448,37 +594,129 @@ def _maybe_apply_hd_early_exit_rules(stats, apply_rules=True):
 
 def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True):
     try:
-        h = header.parse(file_bytes)
-        s = summary.Summary(io.BytesIO(file_bytes))
-        completed = bool(s.get_completed())
-        raw_chat = s.get_chat()
-        raw_platform = s.get_platform()
+        h = None
+        s = None
+        fast_header_data = None
+        standard_header_error = None
+        summary_init_error = None
+        fast_header_error = None
+
+        try:
+            h = header.parse(file_bytes)
+        except Exception as exc:
+            standard_header_error = str(exc)
+            logging.warning(f"⚠️ standard header parse failed: {exc}")
+
+        if fast_parse_header is not None:
+            try:
+                fast_header_data = fast_parse_header(io.BytesIO(file_bytes))
+            except Exception as exc:
+                fast_header_error = str(exc)
+                logging.warning(f"⚠️ fast header parse failed: {exc}")
+
+        try:
+            s = summary.Summary(io.BytesIO(file_bytes))
+        except Exception as exc:
+            summary_init_error = str(exc)
+            logging.warning(f"⚠️ summary init failed: {exc}")
+
+        completed = bool(_safe_summary_call("get_completed", s.get_completed, False)) if s else False
+        raw_chat = _safe_summary_call("get_chat", s.get_chat, []) if s else []
+        raw_platform = _safe_summary_call("get_platform", s.get_platform, {}) if s else {}
         chat = raw_chat if isinstance(raw_chat, list) else []
         platform = raw_platform if isinstance(raw_platform, dict) else {}
-        restored = s.get_restored()
-        resigned_player_numbers = _extract_resigned_player_numbers(s)
-        hd_player_ratings = _extract_hd_player_ratings(h)
-        platform_ratings = _extract_platform_ratings(platform)
-        owner_player_number = s.get_owner()
-        raw_duration_ms = s.get_duration()
+        restored = _safe_summary_call("get_restored", s.get_restored, (False,)) if s else (False,)
+        resigned_player_numbers = _safe_summary_call(
+            "extract_resigned_player_numbers",
+            lambda: _extract_resigned_player_numbers(s),
+            [],
+        ) if s else []
+
+        if h is not None:
+            try:
+                hd_player_ratings = _extract_hd_player_ratings(h)
+            except Exception as exc:
+                logging.warning(f"⚠️ header player rating extraction failed: {exc}")
+                hd_player_ratings = {}
+        else:
+            hd_player_ratings = {}
+
+        try:
+            platform_ratings = _extract_platform_ratings(platform)
+        except Exception as exc:
+            logging.warning(f"⚠️ platform rating extraction failed: {exc}")
+            platform_ratings = {}
+
+        owner_player_number = _safe_summary_call("get_owner", s.get_owner, None) if s else None
+        raw_duration_ms = _safe_summary_call("get_duration", s.get_duration, None) if s else None
         normalized_duration_seconds = _normalize_mgz_duration_seconds(raw_duration_ms)
 
+        raw_map = _safe_summary_call("get_map", s.get_map, {}) if s else {}
+        raw_map = raw_map if isinstance(raw_map, dict) else {}
+        raw_game_type = _safe_summary_call("get_version", s.get_version, "Unknown") if s else "Unknown"
+
+        if not raw_map and fast_header_data:
+            raw_map = _extract_fast_header_map(fast_header_data)
+
+        game_version = None
+        if h is not None:
+            game_version = str(getattr(h, "version", None) or "Unknown")
+        elif isinstance(fast_header_data, dict) and fast_header_data.get("version") is not None:
+            game_version = str(fast_header_data.get("version"))
+        else:
+            game_version = "Unknown"
+
         stats = {
-            "game_version": str(h.version),
+            "game_version": game_version,
             "map": {
-                "name": s.get_map().get("name", "Unknown"),
-                "size": s.get_map().get("size", "Unknown"),
+                "name": raw_map.get("name", "Unknown") if isinstance(raw_map, dict) else "Unknown",
+                "size": raw_map.get("size", "Unknown") if isinstance(raw_map, dict) else "Unknown",
             },
-            "game_type": str(s.get_version()),
+            "game_type": str(raw_game_type),
             "duration": normalized_duration_seconds or 0,
         }
 
         players = []
         winner = None
-        raw_players = list(s.get_players())
+        player_extraction_error = None
+        player_extraction_source = "summary" if s else "summary_unavailable"
+
+        if s is not None:
+            try:
+                raw_players = list(s.get_players())
+            except Exception as exc:
+                player_extraction_error = str(exc)
+                logging.warning(f"⚠️ summary.get_players failed: {exc}")
+                raw_players = []
+        else:
+            raw_players = []
+
+        if not raw_players and h is not None:
+            fallback_players = _extract_header_player_shells(h)
+            if fallback_players:
+                raw_players = fallback_players
+                player_extraction_source = "header_fallback"
+
+        if not raw_players and fast_header_data is not None:
+            fallback_players = _extract_fast_header_player_shells(fast_header_data)
+            if fallback_players:
+                raw_players = fallback_players
+                player_extraction_source = "fast_header_fallback"
+
+        if not raw_players:
+            if player_extraction_error is None:
+                player_extraction_error = "no players extracted from summary/header/fast-header"
+                player_extraction_source = "no_players"
+
+        logging.warning(
+            f"⚠️ parse survived to player loop: "
+            f"player_source={player_extraction_source} raw_players_len={len(raw_players)}"
+        )
+
         achievement_shell_count = 0
         for p in raw_players:
-            player_ratings = hd_player_ratings.get(p.get("number")) or {}
+            player_number = _normalize_rating(p.get("number"))
+            player_ratings = hd_player_ratings.get(player_number) or {}
             rate_snapshot = _normalize_rating(p.get("rate_snapshot"))
             steam_id = player_ratings.get("steam_id") or _normalize_steam_id(p.get("user_id"))
             civilization = p.get("civilization", "Unknown")
@@ -488,7 +726,7 @@ def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True):
             achievements = _compact_value(raw_achievements)
             p_data = {
                 "name": p.get("name", "Unknown"),
-                "number": _normalize_rating(p.get("number")),
+                "number": player_number,
                 "civilization": civilization,
                 "civilization_name": _normalize_civilization_name(civilization),
                 "winner": p.get("winner", False),
@@ -534,10 +772,17 @@ def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True):
 
         stats["players"] = players
         stats["winner"] = winner or "Unknown"
-        stats["event_types"] = _extract_event_types(s)
+        stats["event_types"] = _safe_summary_call(
+            "extract_event_types",
+            lambda: _extract_event_types(s),
+            [],
+        ) if s else []
         visible_score_count = _count_players_with_visible_scores(players)
         achievement_player_count = _count_players_with_achievements(players)
-        has_achievements = bool(s.has_achievements()) or achievement_player_count > 0
+        has_achievements = (
+            bool(_safe_summary_call("has_achievements", s.has_achievements, False))
+            if s else False
+        ) or achievement_player_count > 0
         stats["key_events"] = {
             "completed": completed,
             "has_achievements": has_achievements,
@@ -546,7 +791,7 @@ def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True):
             "achievement_player_count": achievement_player_count,
             "achievement_shell_count": achievement_shell_count,
             "has_achievement_shell": achievement_shell_count > 0,
-            "postgame_available": s.get_postgame() is not None,
+            "postgame_available": (_safe_summary_call("get_postgame", s.get_postgame, None) is not None) if s else False,
             "owner_player_number": owner_player_number,
             "owner_player_name": owner_player_name,
             "resigned_player_numbers": resigned_player_numbers,
@@ -559,8 +804,23 @@ def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True):
             "restored": bool(restored[0]) if isinstance(restored, tuple) and len(restored) > 0 else False,
             "raw_duration_ms": int(raw_duration_ms) if isinstance(raw_duration_ms, (int, float)) else None,
             "duration_source": "mgz_summary_ms_normalized",
+            "player_extraction_source": player_extraction_source,
+            "player_count": len(players),
         }
-        settings_summary = _extract_settings_summary(s)
+        if player_extraction_error:
+            stats["key_events"]["player_extraction_error"] = player_extraction_error
+        if standard_header_error:
+            stats["key_events"]["standard_header_error"] = standard_header_error
+        if summary_init_error:
+            stats["key_events"]["summary_init_error"] = summary_init_error
+        if fast_header_error:
+            stats["key_events"]["fast_header_error"] = fast_header_error
+
+        settings_summary = _safe_summary_call(
+            "extract_settings_summary",
+            lambda: _extract_settings_summary(s),
+            None,
+        ) if s else None
         if settings_summary:
             stats["key_events"]["settings"] = settings_summary
         if platform_ratings:
