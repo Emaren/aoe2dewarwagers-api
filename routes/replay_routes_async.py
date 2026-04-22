@@ -1574,7 +1574,56 @@ async def parse_new_replay(
                     GameStats.is_final.is_(True),
                 )
             )
-            if existing.scalars().first():
+            existing_final_game = existing.scalars().first()
+            if existing_final_game:
+                parse_source = data.parse_source or "json_parse"
+                if _should_upgrade_duplicate_final(
+                    existing_final_game,
+                    parse_reason,
+                    disconnect_detected,
+                    key_events,
+                    players,
+                ):
+                    parsed_payload = {
+                        "game_version": data.game_version,
+                        "game_type": data.game_type,
+                    }
+                    _apply_parsed_upload_to_game(
+                        existing_final_game,
+                        uploader_uid=user_uid,
+                        replay_hash=data.replay_hash,
+                        original_name=data.original_filename or data.replay_file,
+                        parsed=parsed_payload,
+                        map_payload=map_payload,
+                        duration=duration,
+                        winner=winner,
+                        players=players,
+                        event_types=data.event_types,
+                        key_events=key_events,
+                        parse_iteration=data.parse_iteration,
+                        is_final_upload=True,
+                        disconnect_detected=disconnect_detected,
+                        parse_source=parse_source,
+                        parse_reason=parse_reason,
+                        played_on=played_on,
+                    )
+
+                    await _record_parse_attempt(
+                        db,
+                        user_uid=user_uid,
+                        replay_hash=data.replay_hash,
+                        original_filename=data.original_filename,
+                        parse_source=parse_source,
+                        status="duplicate_final_refreshed",
+                        detail="Replay final refreshed with clearer completion metadata.",
+                        upload_mode="internal_json",
+                        file_size_bytes=None,
+                        game_stats_id=existing_final_game.id,
+                        played_on=played_on,
+                    )
+                    await db.commit()
+                    return {"message": "Replay final refreshed with clearer completion metadata."}
+
                 logging.info(f"🛡️ Skipped duplicate final replay: {data.replay_hash}")
                 return {"message": "Replay already parsed as final. Skipped."}
 
