@@ -6,6 +6,7 @@ from types import SimpleNamespace
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from routes.replay_routes_async import (
+    FINAL_METADATA_REFRESH_STATUS,
     FINAL_METADATA_PARSE_REASON,
     FINAL_UNPARSED_PARSE_REASON,
     _build_metadata_final_game_kwargs,
@@ -25,6 +26,11 @@ from routes.replay_routes_async import (
     _should_upgrade_duplicate_final,
     _should_refresh_reviewed_match,
 )
+
+
+def test_metadata_refresh_status_fits_audit_column():
+    assert FINAL_METADATA_REFRESH_STATUS == "final_metadata_refreshed"
+    assert len(FINAL_METADATA_REFRESH_STATUS) <= 32
 
 
 def test_parse_bool_header_understands_live_and_final_flags():

@@ -34,6 +34,7 @@ SUPERSEDED_PARSE_REASON = "superseded_by_later_upload"
 PLACEHOLDER_LIVE_PARSE_REASON = "watcher_live_pending_parse"
 FINAL_UNPARSED_PARSE_REASON = "watcher_final_unparsed"
 FINAL_METADATA_PARSE_REASON = "watcher_final_metadata"
+FINAL_METADATA_REFRESH_STATUS = "final_metadata_refreshed"
 WATCHER_METADATA_SCHEMA = "aoe2dewarwagers.watcher_final_metadata.v2"
 WATCHER_METADATA_MAX_CHARS = 64_000
 
@@ -1366,7 +1367,7 @@ async def _store_metadata_final_upload(
                 replay_hash=replay_hash,
                 original_filename=original_name,
                 parse_source=game_kwargs["parse_source"],
-                status="duplicate_final_metadata_refreshed",
+                status=FINAL_METADATA_REFRESH_STATUS,
                 detail="Replay final refreshed with watcher metadata after parser failure.",
                 upload_mode=upload_mode,
                 file_size_bytes=file_size_bytes,
