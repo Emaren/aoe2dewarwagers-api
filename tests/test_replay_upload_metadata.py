@@ -5,6 +5,8 @@ from types import SimpleNamespace
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from routes.replay_routes_async import (
+    FINAL_UNPARSED_PARSE_REASON,
+    _build_unparsed_final_game_kwargs,
     _derive_upload_parse_metadata,
     _extract_platform_match_id,
     _has_reliable_final_signal,
@@ -172,6 +174,69 @@ def test_has_reliable_final_signal_rejects_paused_unknown_replay():
     )
 
 
+def test_unparsed_final_kwargs_persist_safe_unknown_match():
+    fields = _build_unparsed_final_game_kwargs(
+        parsed={
+            "game_version": "Version.DE",
+            "map": {"name": "Arabia", "size": "Tiny"},
+            "game_type": "Random Map",
+            "duration": 2450,
+            "winner": "Emaren",
+            "players": [{"name": "Emaren", "winner": True}],
+            "event_types": ["resign"],
+            "played_on": "2026-04-21T17:59:10",
+            "key_events": {
+                "completed": True,
+                "completion_source": "scoreboard",
+                "player_extraction_error": "summary exploded",
+                "standard_header_error": "invalid marker",
+                "player_extraction_source": "summary",
+                "player_count": 1,
+            },
+        },
+        parse_source="watcher_final",
+        parser_error=None,
+        parse_iteration=7,
+    )
+
+    assert fields["parse_reason"] == FINAL_UNPARSED_PARSE_REASON
+    assert fields["is_final"] is True
+    assert fields["winner"] == "Unknown"
+    assert fields["players"] == []
+    assert fields["map"] == {"name": "Arabia", "size": "Tiny"}
+    assert fields["duration"] == 2450
+    assert fields["played_on"] is not None
+
+    key_events = fields["key_events"]
+    assert key_events["final_unparsed"] is True
+    assert key_events["trusted_player_data"] is False
+    assert key_events["player_extraction_source"] == "no_players"
+    assert "player_extraction_error: summary exploded" in key_events["player_extraction_error"]
+    assert "standard_header_error: invalid marker" in key_events["player_extraction_error"]
+    assert key_events["completed"] is False
+    assert key_events["postgame_available"] is False
+    assert key_events["player_count"] == 0
+    assert "completion_source" not in key_events
+    assert not _has_reliable_final_signal(
+        {"winner": fields["winner"], "key_events": key_events}
+    )
+
+
+def test_unparsed_final_kwargs_use_parser_error_when_parse_returns_none():
+    fields = _build_unparsed_final_game_kwargs(
+        parsed=None,
+        parse_source="watcher_final",
+        parser_error="unsupported DE replay header",
+        parse_iteration=2,
+    )
+
+    assert fields["parse_reason"] == FINAL_UNPARSED_PARSE_REASON
+    assert fields["winner"] == "Unknown"
+    assert fields["players"] == []
+    assert fields["key_events"]["player_extraction_source"] == "no_players"
+    assert fields["key_events"]["player_extraction_error"] == "unsupported DE replay header"
+
+
 def test_normalize_live_disconnect_detected_clears_active_live_false_positive():
     assert not _normalize_live_disconnect_detected(
         False,
@@ -219,6 +284,34 @@ def test_should_upgrade_duplicate_final_when_resignation_truth_is_clearer():
             "achievement_player_count": 0,
             "achievement_shell_count": 2,
         },
+    )
+
+
+def test_should_upgrade_unparsed_final_when_trusted_player_data_arrives():
+    existing_game = SimpleNamespace(
+        parse_reason=FINAL_UNPARSED_PARSE_REASON,
+        disconnect_detected=False,
+        key_events={
+            "final_unparsed": True,
+            "trusted_player_data": False,
+            "player_extraction_source": "no_players",
+            "player_count": 0,
+        },
+    )
+
+    assert _should_upgrade_duplicate_final(
+        existing_game,
+        "watcher_final_submission",
+        False,
+        {
+            "completed": False,
+            "player_extraction_source": "header_fallback",
+            "player_count": 2,
+        },
+        [
+            {"name": "Emaren", "winner": None},
+            {"name": "Sniper", "winner": None},
+        ],
     )
 
 

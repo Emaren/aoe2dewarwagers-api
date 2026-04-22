@@ -52,25 +52,35 @@ CIVILIZATION_NAMES = {
 # 🔁 Async-compatible wrapper around sync MGZ logic
 # ───────────────────────────────────────────────
 async def parse_replay_full(replay_path, apply_hd_early_exit_rules=True):
+    parsed, _ = await parse_replay_full_with_error(replay_path, apply_hd_early_exit_rules)
+    return parsed
+
+
+async def parse_replay_full_with_error(replay_path, apply_hd_early_exit_rules=True):
     if not os.path.exists(replay_path):
-        logging.error(f"❌ Replay not found: {replay_path}")
-        return None
+        error = f"Replay not found: {replay_path}"
+        logging.error(f"❌ {error}")
+        return None, error
 
     try:
         async with aiofiles.open(replay_path, "rb") as f:
             file_bytes = await f.read()
 
         # Use thread to safely run blocking mgz sync logic
-        return await asyncio.to_thread(
+        parsed = await asyncio.to_thread(
             _parse_sync_bytes,
             replay_path,
             file_bytes,
             apply_hd_early_exit_rules,
+            True,
         )
+        if parsed is None:
+            return None, "mgz parser returned no parsed payload"
+        return parsed, None
 
     except Exception as e:
         logging.error(f"❌ parse error: {e}")
-        return None
+        return None, str(e)
 
 
 def _extract_event_types(summary_obj):
@@ -592,7 +602,7 @@ def _maybe_apply_hd_early_exit_rules(stats, apply_rules=True):
     return _apply_hd_early_exit_rules(stats)
 
 
-def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True):
+def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True, raise_on_error=False):
     try:
         h = None
         s = None
@@ -841,6 +851,8 @@ def _parse_sync_bytes(replay_path, file_bytes, apply_hd_early_exit_rules=True):
 
     except Exception as e:
         logging.error(f"❌ sync parse error: {e}")
+        if raise_on_error:
+            raise
         return None
 
 # ───────────────────────────────────────────────

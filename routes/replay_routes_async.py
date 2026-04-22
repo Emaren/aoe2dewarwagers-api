@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover
     ApiKey = None  # type: ignore
     ReplayParseAttempt = None  # type: ignore
 
-from utils.replay_parser import parse_replay_full, hash_replay_file
+from utils.replay_parser import parse_replay_full_with_error, hash_replay_file
 
 router = APIRouter(prefix="/api", tags=["replay"])
 
@@ -31,6 +31,7 @@ INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")  # optional; if set, enforces a
 MAX_REPLAY_UPLOAD_BYTES = int(os.getenv("MAX_REPLAY_UPLOAD_BYTES", str(250 * 1024 * 1024)))
 SUPERSEDED_PARSE_REASON = "superseded_by_later_upload"
 PLACEHOLDER_LIVE_PARSE_REASON = "watcher_live_pending_parse"
+FINAL_UNPARSED_PARSE_REASON = "watcher_final_unparsed"
 
 WATCHER_KEY_RE = re.compile(r"^wolo_([a-f0-9]{12})_(.+)$", re.IGNORECASE)
 
@@ -402,6 +403,16 @@ async def _load_existing_final_by_platform_match_id(db, platform_match_id: Optio
     return result.scalars().first()
 
 
+async def _load_existing_final_by_replay_hash(db, replay_hash: str):
+    result = await db.execute(
+        select(GameStats).where(
+            GameStats.replay_hash == replay_hash,
+            GameStats.is_final.is_(True),
+        )
+    )
+    return result.scalars().first()
+
+
 def _match_uploader_player(players: list, user, claimed_name: Optional[str]):
     steam_id = str(getattr(user, "steam_id", "") or "").strip()
     if steam_id:
@@ -548,6 +559,209 @@ def _coerce_positive_int(value):
     return 0
 
 
+def _clean_key_event_error(value: Optional[str], fallback: Optional[str] = None):
+    raw = value if value is not None else fallback
+    cleaned = " ".join(str(raw or "").split()).strip()
+    if not cleaned:
+        return "unknown replay parser failure"
+    return cleaned[:1000]
+
+
+def _extract_unparsed_final_parser_error(parsed: Optional[dict], parser_error: Optional[str]):
+    key_events = parsed.get("key_events") if isinstance(parsed, dict) else {}
+    if not isinstance(key_events, dict):
+        key_events = {}
+
+    details = []
+    for key in (
+        "player_extraction_error",
+        "summary_init_error",
+        "standard_header_error",
+        "fast_header_error",
+        "parser_error",
+        "parse_error",
+    ):
+        value = key_events.get(key)
+        if value:
+            details.append(f"{key}: {_clean_key_event_error(str(value))}")
+
+    if details:
+        return _clean_key_event_error("; ".join(details))
+
+    return _clean_key_event_error(parser_error, "replay parser returned no trusted player data")
+
+
+def _build_unparsed_final_game_kwargs(
+    *,
+    parsed: Optional[dict],
+    parse_source: str,
+    parser_error: Optional[str],
+    parse_iteration: int,
+):
+    parsed_payload = parsed if isinstance(parsed, dict) else {}
+    map_info = parsed_payload.get("map") if isinstance(parsed_payload.get("map"), dict) else {}
+    raw_duration = parsed_payload.get("duration") or parsed_payload.get("game_duration") or 0
+    duration = _coerce_positive_int(raw_duration)
+    raw_played_on = parsed_payload.get("played_on")
+    key_events = (
+        dict(parsed_payload.get("key_events"))
+        if isinstance(parsed_payload.get("key_events"), dict)
+        else {}
+    )
+    key_events.pop("completion_source", None)
+    key_events.pop("winner_inference", None)
+    key_events.update(
+        {
+            "completed": False,
+            "postgame_available": False,
+            "has_achievements": False,
+            "has_scores": False,
+            "player_score_count": 0,
+            "achievement_player_count": 0,
+            "player_count": 0,
+            "player_extraction_source": "no_players",
+            "player_extraction_error": _extract_unparsed_final_parser_error(
+                parsed_payload,
+                parser_error,
+            ),
+            "trusted_player_data": False,
+            "final_unparsed": True,
+        }
+    )
+
+    return {
+        "game_version": parsed_payload.get("game_version"),
+        "map": {
+            "name": map_info.get("name", "Unknown"),
+            "size": map_info.get("size", "Unknown"),
+        },
+        "game_type": parsed_payload.get("game_type"),
+        "duration": duration,
+        "game_duration": duration,
+        "winner": "Unknown",
+        "players": [],
+        "event_types": parsed_payload.get("event_types")
+        if isinstance(parsed_payload.get("event_types"), list)
+        else [],
+        "key_events": key_events,
+        "parse_iteration": parse_iteration,
+        "is_final": True,
+        "disconnect_detected": False,
+        "parse_source": _clean_detail(parse_source, "watcher_final") or "watcher_final",
+        "parse_reason": FINAL_UNPARSED_PARSE_REASON,
+        "played_on": _safe_iso_datetime(raw_played_on if isinstance(raw_played_on, str) else None),
+    }
+
+
+async def _store_unparsed_final_upload(
+    db,
+    *,
+    uploader_uid: Optional[str],
+    replay_hash: str,
+    original_name: str,
+    parsed: Optional[dict],
+    parse_source: str,
+    parser_error: Optional[str],
+    parse_iteration: int,
+    upload_mode: str,
+    file_size_bytes: Optional[int],
+):
+    game_kwargs = _build_unparsed_final_game_kwargs(
+        parsed=parsed,
+        parse_source=parse_source,
+        parser_error=parser_error,
+        parse_iteration=parse_iteration,
+    )
+
+    existing_final_game = await _load_existing_final_by_replay_hash(db, replay_hash)
+    if existing_final_game:
+        await _record_parse_attempt(
+            db,
+            user_uid=uploader_uid,
+            replay_hash=replay_hash,
+            original_filename=original_name,
+            parse_source=game_kwargs["parse_source"],
+            status="duplicate_final",
+            detail="Replay already stored as final. Skipped.",
+            upload_mode=upload_mode,
+            file_size_bytes=file_size_bytes,
+            game_stats_id=existing_final_game.id,
+            played_on=game_kwargs["played_on"],
+        )
+        await db.commit()
+        return {
+            "message": "Replay already stored as final. Skipped.",
+            "replay_hash": replay_hash,
+            "uploader_uid": uploader_uid,
+            "upload_mode": upload_mode,
+            "is_final": True,
+            "unparsed_final": existing_final_game.parse_reason == FINAL_UNPARSED_PARSE_REASON,
+        }
+
+    previous_versions = []
+    if original_name and uploader_uid and uploader_uid != "system":
+        prior = await db.execute(
+            select(GameStats.id, GameStats.replay_hash).where(
+                GameStats.user_uid == uploader_uid,
+                GameStats.original_filename == original_name,
+                GameStats.is_final.is_(True),
+            )
+        )
+        previous_versions = [
+            row.id
+            for row in prior
+            if row.replay_hash != replay_hash
+        ]
+
+    game = GameStats(
+        user_uid=uploader_uid or "system",
+        replay_file=original_name,
+        replay_hash=replay_hash,
+        original_filename=original_name,
+        **game_kwargs,
+    )
+    db.add(game)
+    await db.flush()
+
+    if previous_versions:
+        await db.execute(
+            update(GameStats)
+            .where(GameStats.id.in_(previous_versions))
+            .values(
+                is_final=False,
+                parse_reason=SUPERSEDED_PARSE_REASON,
+            )
+        )
+
+    await _record_parse_attempt(
+        db,
+        user_uid=uploader_uid,
+        replay_hash=replay_hash,
+        original_filename=original_name,
+        parse_source=game_kwargs["parse_source"],
+        status="stored_unparsed_final",
+        detail="Final replay stored without trusted player data because replay parsing failed.",
+        upload_mode=upload_mode,
+        file_size_bytes=file_size_bytes,
+        game_stats_id=game.id,
+        played_on=game_kwargs["played_on"],
+    )
+    await db.commit()
+    return {
+        "message": "Final replay stored without trusted player data.",
+        "replay_hash": replay_hash,
+        "winner": "Unknown",
+        "players_count": 0,
+        "uploader_uid": uploader_uid,
+        "upload_mode": upload_mode,
+        "parse_iteration": parse_iteration,
+        "is_final": True,
+        "pending_parse": False,
+        "unparsed_final": True,
+        "parse_reason": FINAL_UNPARSED_PARSE_REASON,
+    }
+
+
 def _key_event_chat_count(value):
     if isinstance(value, dict):
         return _coerce_positive_int(value.get("chat_count"))
@@ -578,14 +792,40 @@ def _event_type_count(value) -> int:
     return 0
 
 
+def _has_trusted_player_data(players: Optional[list], key_events: dict):
+    if not isinstance(players, list) or len(players) < 2:
+        return False
+
+    if isinstance(key_events, dict) and key_events.get("trusted_player_data") is False:
+        return False
+
+    player_source = str(key_events.get("player_extraction_source") or "").strip()
+    if player_source in {"", "no_players", "summary_unavailable"}:
+        return False
+
+    named_players = [
+        player
+        for player in players
+        if isinstance(player, dict) and str(player.get("name") or "").strip()
+    ]
+    return len(named_players) >= 2
+
+
 def _should_upgrade_duplicate_final(
     existing_game,
     incoming_parse_reason: Optional[str],
     incoming_disconnect_detected: bool,
     incoming_key_events: dict,
+    incoming_players: Optional[list] = None,
 ):
     existing_key_events = getattr(existing_game, "key_events", {}) or {}
     existing_parse_reason = getattr(existing_game, "parse_reason", None)
+
+    if (
+        existing_parse_reason == FINAL_UNPARSED_PARSE_REASON
+        and _has_trusted_player_data(incoming_players, incoming_key_events)
+    ):
+        return True
 
     if incoming_parse_reason == "recorded_resignation_final" and existing_parse_reason != incoming_parse_reason:
         return True
@@ -861,7 +1101,7 @@ async def upload_replay_file(
                 parsed_reason=None,
             )
 
-            parsed = await parse_replay_full(
+            parsed, parser_error = await parse_replay_full_with_error(
                 temp_path,
                 apply_hd_early_exit_rules=is_final_upload,
             )
@@ -937,6 +1177,24 @@ async def upload_replay_file(
                         "pending_parse": True,
                     }
 
+                if is_final_upload:
+                    logging.warning(
+                        "⚠️ final replay parser failed; storing unparsed final row: "
+                        f"file={original_name} hash={replay_hash} parser_error={parser_error}"
+                    )
+                    return await _store_unparsed_final_upload(
+                        db,
+                        uploader_uid=uploader_uid,
+                        replay_hash=replay_hash,
+                        original_name=original_name,
+                        parsed=None,
+                        parse_source=parse_source_hint,
+                        parser_error=parser_error or parse_failure_detail,
+                        parse_iteration=parse_iteration,
+                        upload_mode=mode,
+                        file_size_bytes=written,
+                    )
+
                 await _record_parse_attempt(
                     db,
                     user_uid=uploader_uid,
@@ -1000,20 +1258,18 @@ async def upload_replay_file(
                     f"player_error={key_events.get('player_extraction_error')} "
                     f"parse_reason={parse_reason}"
                 )
-                await _record_parse_attempt(
+                return await _store_unparsed_final_upload(
                     db,
-                    user_uid=uploader_uid,
+                    uploader_uid=uploader_uid,
                     replay_hash=replay_hash,
-                    original_filename=original_name,
+                    original_name=original_name,
+                    parsed=parsed,
                     parse_source=parse_source,
-                    status="final_not_ready",
-                    detail=parse_failure_detail,
+                    parser_error=parser_error or parse_failure_detail,
+                    parse_iteration=parse_iteration,
                     upload_mode=mode,
                     file_size_bytes=written,
-                    played_on=played_on,
                 )
-                await db.commit()
-                raise HTTPException(status_code=422, detail=parse_failure_detail)
 
             if not is_final_upload:
                 existing_placeholder_live = await _load_existing_placeholder_live_game(
@@ -1066,19 +1322,14 @@ async def upload_replay_file(
                         "is_final": False,
                     }
 
-            existing_final = await db.execute(
-                select(GameStats).where(
-                    GameStats.replay_hash == replay_hash,
-                    GameStats.is_final.is_(True),
-                )
-            )
-            existing_final_game = existing_final.scalars().first()
+            existing_final_game = await _load_existing_final_by_replay_hash(db, replay_hash)
             if existing_final_game:
                 if is_final_upload and _should_upgrade_duplicate_final(
                     existing_final_game,
                     parse_reason,
                     disconnect_detected,
                     key_events,
+                    players,
                 ):
                     existing_final_game.user_uid = uploader_uid or existing_final_game.user_uid
                     existing_final_game.replay_file = original_name
