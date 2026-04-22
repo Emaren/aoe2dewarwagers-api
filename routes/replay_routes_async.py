@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, Header, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, Query, Header, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from db.db import get_db
@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import base64
 import re
+import json
 from sqlalchemy import text, update
 
 # Prefer full model set if present (User/ApiKey added in recent migration)
@@ -32,6 +33,9 @@ MAX_REPLAY_UPLOAD_BYTES = int(os.getenv("MAX_REPLAY_UPLOAD_BYTES", str(250 * 102
 SUPERSEDED_PARSE_REASON = "superseded_by_later_upload"
 PLACEHOLDER_LIVE_PARSE_REASON = "watcher_live_pending_parse"
 FINAL_UNPARSED_PARSE_REASON = "watcher_final_unparsed"
+FINAL_METADATA_PARSE_REASON = "watcher_final_metadata"
+WATCHER_METADATA_SCHEMA = "aoe2dewarwagers.watcher_final_metadata.v1"
+WATCHER_METADATA_MAX_CHARS = 64_000
 
 WATCHER_KEY_RE = re.compile(r"^wolo_([a-f0-9]{12})_(.+)$", re.IGNORECASE)
 
@@ -559,6 +563,343 @@ def _coerce_positive_int(value):
     return 0
 
 
+def _coerce_optional_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _clean_metadata_string(value, max_length: int = 255):
+    if value is None:
+        return None
+    cleaned = " ".join(str(value).split()).strip()
+    return cleaned[:max_length] if cleaned else None
+
+
+def _metadata_datetime(value):
+    if isinstance(value, str):
+        return _safe_iso_datetime(value)
+    return None
+
+
+def _parse_watcher_metadata(raw_metadata: Optional[str], replay_hash: str):
+    if not raw_metadata:
+        return None, None
+
+    if len(raw_metadata) > WATCHER_METADATA_MAX_CHARS:
+        return None, "watcher metadata payload too large"
+
+    try:
+        parsed = json.loads(raw_metadata)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid watcher metadata json: {exc.msg}"
+
+    if not isinstance(parsed, dict):
+        return None, "watcher metadata must be a JSON object"
+
+    metadata_hash = _clean_metadata_string(parsed.get("replay_hash"), 80)
+    if metadata_hash and metadata_hash.lower() != replay_hash.lower():
+        return None, "watcher metadata replay_hash did not match uploaded file"
+
+    return parsed, None
+
+
+def _normalize_metadata_players(metadata: dict, winner_name: Optional[str], winner_reliable: bool):
+    raw_players = metadata.get("players")
+    if not isinstance(raw_players, list):
+        return []
+
+    players = []
+    seen = set()
+    for index, raw_player in enumerate(raw_players, start=1):
+        if not isinstance(raw_player, dict):
+            continue
+
+        name = _clean_metadata_string(
+            raw_player.get("name")
+            or raw_player.get("player_name")
+            or raw_player.get("profile_name"),
+            100,
+        )
+        if not name:
+            continue
+
+        norm = _norm_name(name)
+        if norm in seen:
+            continue
+        seen.add(norm)
+
+        player = {
+            "name": name,
+            "source": "watcher_metadata",
+        }
+        for target_key, source_keys in {
+            "civilization": ("civilization", "civ", "civilization_name"),
+            "color": ("color", "color_name"),
+            "team": ("team", "team_id"),
+            "user_id": ("user_id", "steam_id", "profile_id"),
+        }.items():
+            for source_key in source_keys:
+                value = _clean_metadata_string(raw_player.get(source_key), 100)
+                if value:
+                    player[target_key] = value
+                    break
+
+        slot = _coerce_positive_int(
+            raw_player.get("slot") or raw_player.get("number") or raw_player.get("player_number")
+        )
+        player["number"] = slot or index
+
+        raw_winner = _coerce_optional_bool(raw_player.get("winner"))
+        if winner_reliable:
+            if winner_name:
+                player["winner"] = _norm_name(name) == _norm_name(winner_name)
+            elif raw_winner is not None:
+                player["winner"] = raw_winner
+        else:
+            player["winner"] = None
+
+        players.append(player)
+
+    return players
+
+
+def _normalize_watcher_metadata(
+    metadata: Optional[dict],
+    *,
+    replay_hash: str,
+    original_name: str,
+    uploader_uid: Optional[str],
+    file_size_bytes: Optional[int],
+):
+    if not isinstance(metadata, dict):
+        return None
+
+    schema = _clean_metadata_string(metadata.get("schema"), 120)
+    version = _coerce_positive_int(metadata.get("version")) or 1
+    trust = metadata.get("trust") if isinstance(metadata.get("trust"), dict) else {}
+    winner_payload = metadata.get("winner")
+    winner_name = None
+    winner_reliable = False
+    if isinstance(winner_payload, str):
+        winner_name = _clean_metadata_string(winner_payload, 100)
+    elif isinstance(winner_payload, dict):
+        winner_name = _clean_metadata_string(
+            winner_payload.get("name") or winner_payload.get("player_name") or winner_payload.get("value"),
+            100,
+        )
+        winner_reliable = _coerce_optional_bool(
+            winner_payload.get("reliable") or winner_payload.get("trusted")
+        ) is True
+    winner_reliable = winner_reliable or _coerce_optional_bool(
+        trust.get("winner") or trust.get("winner_reliable")
+    ) is True
+    if not winner_reliable:
+        winner_name = None
+
+    players = _normalize_metadata_players(metadata, winner_name, winner_reliable)
+    player_count = _coerce_positive_int(metadata.get("player_count") or metadata.get("players_count"))
+    if not player_count and players:
+        player_count = len(players)
+
+    map_metadata = metadata.get("map") if isinstance(metadata.get("map"), dict) else {}
+    map_name = _clean_metadata_string(map_metadata.get("name") or metadata.get("map_name"), 120)
+    map_size = _clean_metadata_string(map_metadata.get("size") or metadata.get("map_size"), 80)
+    mode = _clean_metadata_string(
+        metadata.get("mode") or metadata.get("game_mode") or metadata.get("game_type"),
+        80,
+    )
+    rated = _coerce_optional_bool(metadata.get("rated") if "rated" in metadata else metadata.get("is_rated"))
+    started_at = _metadata_datetime(metadata.get("started_at") or metadata.get("startedAt"))
+    ended_at = _metadata_datetime(metadata.get("ended_at") or metadata.get("endedAt"))
+    uploaded_at = _metadata_datetime(metadata.get("uploaded_at") or metadata.get("uploadedAt"))
+    session_id = _clean_metadata_string(metadata.get("session_id") or metadata.get("sessionId"), 120)
+    lobby_id = _clean_metadata_string(
+        metadata.get("lobby_id") or metadata.get("lobbyId") or metadata.get("match_id"),
+        120,
+    )
+    filename = _clean_metadata_string(
+        metadata.get("filename") or metadata.get("original_filename") or original_name,
+        255,
+    )
+    metadata_sources = metadata.get("metadata_sources")
+    if not isinstance(metadata_sources, list):
+        metadata_sources = [metadata.get("metadata_source") or "watcher_metadata"]
+    metadata_sources = [
+        source
+        for source in (
+            _clean_metadata_string(source, 80)
+            for source in metadata_sources
+        )
+        if source
+    ]
+    if not metadata_sources:
+        metadata_sources = ["watcher_metadata"]
+
+    trusted_player_data = (
+        _coerce_optional_bool(trust.get("trusted_player_data") or trust.get("player_data")) is True
+        and len(players) >= 2
+    )
+
+    return {
+        "schema": schema or WATCHER_METADATA_SCHEMA,
+        "version": version,
+        "replay_hash": replay_hash,
+        "watcher_uid": _clean_metadata_string(metadata.get("watcher_uid"), 120),
+        "uploader_uid": uploader_uid,
+        "session_id": session_id,
+        "lobby_id": lobby_id,
+        "filename": filename or original_name,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "uploaded_at": uploaded_at,
+        "file_size_bytes": _coerce_positive_int(metadata.get("file_size_bytes")) or file_size_bytes,
+        "players": players,
+        "player_count": player_count or 0,
+        "map": {
+            "name": map_name or "Unknown",
+            "size": map_size or "Unknown",
+        },
+        "game_type": mode,
+        "rated": rated,
+        "winner": winner_name or "Unknown",
+        "winner_reliable": bool(winner_name and winner_reliable),
+        "trusted_player_data": trusted_player_data,
+        "metadata_sources": metadata_sources,
+        "local_sidecar_filename": _clean_metadata_string(metadata.get("local_sidecar_filename"), 255),
+    }
+
+
+def _has_meaningful_watcher_metadata(normalized_metadata: Optional[dict]):
+    if not isinstance(normalized_metadata, dict):
+        return False
+
+    return any(
+        [
+            normalized_metadata.get("session_id"),
+            normalized_metadata.get("lobby_id"),
+            normalized_metadata.get("started_at"),
+            normalized_metadata.get("ended_at"),
+            normalized_metadata.get("uploaded_at"),
+            normalized_metadata.get("file_size_bytes"),
+            normalized_metadata.get("player_count"),
+            normalized_metadata.get("players"),
+            normalized_metadata.get("map", {}).get("name") not in {None, "", "Unknown"},
+        ]
+    )
+
+
+def _build_replay_parser_failure_snapshot(parsed: Optional[dict], parser_error: Optional[str]):
+    parsed_payload = parsed if isinstance(parsed, dict) else {}
+    key_events = parsed_payload.get("key_events") if isinstance(parsed_payload.get("key_events"), dict) else {}
+
+    return {
+        "trusted": False,
+        "winner": parsed_payload.get("winner") or "Unknown",
+        "completed": parsed_payload.get("completed"),
+        "parse_reason": parsed_payload.get("parse_reason"),
+        "players_count": len(parsed_payload.get("players")) if isinstance(parsed_payload.get("players"), list) else 0,
+        "player_extraction_source": key_events.get("player_extraction_source"),
+        "player_extraction_error": _extract_unparsed_final_parser_error(parsed_payload, parser_error),
+    }
+
+
+def _build_metadata_final_game_kwargs(
+    *,
+    parsed: Optional[dict],
+    normalized_metadata: dict,
+    parse_source: str,
+    parser_error: Optional[str],
+    parse_iteration: int,
+):
+    parsed_payload = parsed if isinstance(parsed, dict) else {}
+    raw_duration = parsed_payload.get("duration") or parsed_payload.get("game_duration") or 0
+    duration = _coerce_positive_int(raw_duration)
+    started_at = normalized_metadata.get("started_at")
+    ended_at = normalized_metadata.get("ended_at")
+    if duration <= 0 and started_at and ended_at:
+        try:
+            duration = max(0, int((ended_at - started_at).total_seconds()))
+        except TypeError:
+            duration = 0
+
+    players = normalized_metadata.get("players") if isinstance(normalized_metadata.get("players"), list) else []
+    player_count = len(players) or _coerce_positive_int(normalized_metadata.get("player_count"))
+    trusted_player_data = bool(normalized_metadata.get("trusted_player_data") and len(players) >= 2)
+    winner = normalized_metadata.get("winner") if normalized_metadata.get("winner_reliable") else "Unknown"
+    if not winner:
+        winner = "Unknown"
+
+    replay_parser = _build_replay_parser_failure_snapshot(parsed_payload, parser_error)
+    key_events = {
+        "completed": False,
+        "postgame_available": False,
+        "has_achievements": False,
+        "has_scores": False,
+        "player_score_count": 0,
+        "achievement_player_count": 0,
+        "player_count": player_count,
+        "player_data_source": "watcher_metadata",
+        "player_extraction_source": "watcher_metadata" if players else "no_players",
+        "player_extraction_error": replay_parser["player_extraction_error"],
+        "trusted_player_data": trusted_player_data,
+        "replay_parser_trust": False,
+        "bet_arming_eligible": False,
+        "watcher_final_metadata": True,
+        "final_unparsed": False,
+        "watcher_metadata": {
+            "schema": normalized_metadata.get("schema"),
+            "version": normalized_metadata.get("version"),
+            "sources": normalized_metadata.get("metadata_sources"),
+            "session_id": normalized_metadata.get("session_id"),
+            "lobby_id": normalized_metadata.get("lobby_id"),
+            "filename": normalized_metadata.get("filename"),
+            "started_at": started_at.isoformat() if started_at else None,
+            "ended_at": ended_at.isoformat() if ended_at else None,
+            "uploaded_at": normalized_metadata.get("uploaded_at").isoformat()
+            if normalized_metadata.get("uploaded_at")
+            else None,
+            "file_size_bytes": normalized_metadata.get("file_size_bytes"),
+            "player_count": player_count,
+            "players_known": bool(players),
+            "map_known": normalized_metadata.get("map", {}).get("name") not in {None, "", "Unknown"},
+            "rated": normalized_metadata.get("rated"),
+            "winner_reliable": bool(normalized_metadata.get("winner_reliable")),
+            "trusted_player_data": trusted_player_data,
+            "local_sidecar_filename": normalized_metadata.get("local_sidecar_filename"),
+        },
+        "replay_parser": replay_parser,
+    }
+    if normalized_metadata.get("rated") is not None:
+        key_events["rated"] = normalized_metadata.get("rated")
+
+    return {
+        "game_version": parsed_payload.get("game_version"),
+        "map": normalized_metadata.get("map") or {"name": "Unknown", "size": "Unknown"},
+        "game_type": normalized_metadata.get("game_type") or parsed_payload.get("game_type"),
+        "duration": duration,
+        "game_duration": duration,
+        "winner": winner,
+        "players": players,
+        "event_types": parsed_payload.get("event_types")
+        if isinstance(parsed_payload.get("event_types"), list)
+        else [],
+        "key_events": key_events,
+        "parse_iteration": parse_iteration,
+        "is_final": True,
+        "disconnect_detected": False,
+        "parse_source": _clean_detail(parse_source, "watcher_final") or "watcher_final",
+        "parse_reason": FINAL_METADATA_PARSE_REASON,
+        "played_on": started_at,
+    }
+
+
 def _clean_key_event_error(value: Optional[str], fallback: Optional[str] = None):
     raw = value if value is not None else fallback
     cleaned = " ".join(str(raw or "").split()).strip()
@@ -762,6 +1103,225 @@ async def _store_unparsed_final_upload(
     }
 
 
+def _apply_final_game_kwargs(game, *, uploader_uid: Optional[str], original_name: str, replay_hash: str, game_kwargs: dict):
+    game.user_uid = uploader_uid or getattr(game, "user_uid", None) or "system"
+    game.replay_file = original_name
+    game.replay_hash = replay_hash
+    game.original_filename = original_name
+    game.game_version = game_kwargs["game_version"]
+    game.map = game_kwargs["map"]
+    game.game_type = game_kwargs["game_type"]
+    game.duration = game_kwargs["duration"]
+    game.game_duration = game_kwargs["game_duration"]
+    game.winner = game_kwargs["winner"]
+    game.players = game_kwargs["players"]
+    game.event_types = game_kwargs["event_types"]
+    game.key_events = game_kwargs["key_events"]
+    game.parse_iteration = game_kwargs["parse_iteration"]
+    game.is_final = True
+    game.disconnect_detected = game_kwargs["disconnect_detected"]
+    game.parse_source = game_kwargs["parse_source"]
+    game.parse_reason = game_kwargs["parse_reason"]
+    game.timestamp = datetime.utcnow()
+    if game_kwargs.get("played_on") is not None:
+        game.played_on = game_kwargs["played_on"]
+
+
+def _metadata_player_count_from_game(game):
+    players = getattr(game, "players", None)
+    if isinstance(players, list):
+        return len(
+            [
+                player
+                for player in players
+                if isinstance(player, dict) and _clean_metadata_string(player.get("name"), 100)
+            ]
+        )
+    return 0
+
+
+def _should_refresh_watcher_metadata_final(existing_game, incoming_game_kwargs: dict):
+    existing_parse_reason = getattr(existing_game, "parse_reason", None)
+    if existing_parse_reason == FINAL_UNPARSED_PARSE_REASON:
+        return True
+    if existing_parse_reason != FINAL_METADATA_PARSE_REASON:
+        return False
+
+    existing_key_events = getattr(existing_game, "key_events", {}) or {}
+    incoming_key_events = incoming_game_kwargs.get("key_events") or {}
+    existing_count = _metadata_player_count_from_game(existing_game)
+    incoming_count = len(incoming_game_kwargs.get("players") or [])
+    if incoming_count > existing_count:
+        return True
+
+    if (
+        incoming_key_events.get("trusted_player_data") is True
+        and existing_key_events.get("trusted_player_data") is not True
+    ):
+        return True
+
+    existing_winner = _clean_metadata_string(getattr(existing_game, "winner", None), 100)
+    incoming_winner = _clean_metadata_string(incoming_game_kwargs.get("winner"), 100)
+    if incoming_winner and incoming_winner != "Unknown" and existing_winner in {None, "", "Unknown"}:
+        return True
+
+    existing_map = getattr(existing_game, "map", {}) or {}
+    incoming_map = incoming_game_kwargs.get("map") or {}
+    existing_map_name = _clean_metadata_string(existing_map.get("name") if isinstance(existing_map, dict) else None, 120)
+    incoming_map_name = _clean_metadata_string(incoming_map.get("name") if isinstance(incoming_map, dict) else None, 120)
+    if incoming_map_name and incoming_map_name != "Unknown" and existing_map_name in {None, "", "Unknown"}:
+        return True
+
+    return False
+
+
+async def _store_metadata_final_upload(
+    db,
+    *,
+    uploader_uid: Optional[str],
+    replay_hash: str,
+    original_name: str,
+    parsed: Optional[dict],
+    parse_source: str,
+    parser_error: Optional[str],
+    parse_iteration: int,
+    upload_mode: str,
+    file_size_bytes: Optional[int],
+    normalized_metadata: dict,
+):
+    game_kwargs = _build_metadata_final_game_kwargs(
+        parsed=parsed,
+        normalized_metadata=normalized_metadata,
+        parse_source=parse_source,
+        parser_error=parser_error,
+        parse_iteration=parse_iteration,
+    )
+
+    existing_final_game = await _load_existing_final_by_replay_hash(db, replay_hash)
+    if existing_final_game:
+        if _should_refresh_watcher_metadata_final(existing_final_game, game_kwargs):
+            _apply_final_game_kwargs(
+                existing_final_game,
+                uploader_uid=uploader_uid,
+                original_name=original_name,
+                replay_hash=replay_hash,
+                game_kwargs=game_kwargs,
+            )
+            await _record_parse_attempt(
+                db,
+                user_uid=uploader_uid,
+                replay_hash=replay_hash,
+                original_filename=original_name,
+                parse_source=game_kwargs["parse_source"],
+                status="duplicate_final_metadata_refreshed",
+                detail="Replay final refreshed with watcher metadata after parser failure.",
+                upload_mode=upload_mode,
+                file_size_bytes=file_size_bytes,
+                game_stats_id=existing_final_game.id,
+                played_on=game_kwargs["played_on"],
+            )
+            await db.commit()
+            return {
+                "message": "Final replay refreshed with watcher metadata.",
+                "replay_hash": replay_hash,
+                "winner": game_kwargs["winner"],
+                "players_count": len(game_kwargs["players"]),
+                "uploader_uid": uploader_uid,
+                "upload_mode": upload_mode,
+                "parse_iteration": parse_iteration,
+                "is_final": True,
+                "metadata_final": True,
+                "parse_reason": FINAL_METADATA_PARSE_REASON,
+            }
+
+        await _record_parse_attempt(
+            db,
+            user_uid=uploader_uid,
+            replay_hash=replay_hash,
+            original_filename=original_name,
+            parse_source=game_kwargs["parse_source"],
+            status="duplicate_final",
+            detail="Replay already stored as final. Skipped.",
+            upload_mode=upload_mode,
+            file_size_bytes=file_size_bytes,
+            game_stats_id=existing_final_game.id,
+            played_on=game_kwargs["played_on"],
+        )
+        await db.commit()
+        return {
+            "message": "Replay already stored as final. Skipped.",
+            "replay_hash": replay_hash,
+            "uploader_uid": uploader_uid,
+            "upload_mode": upload_mode,
+            "is_final": True,
+            "metadata_final": existing_final_game.parse_reason == FINAL_METADATA_PARSE_REASON,
+            "parse_reason": existing_final_game.parse_reason,
+        }
+
+    previous_versions = []
+    if original_name and uploader_uid and uploader_uid != "system":
+        prior = await db.execute(
+            select(GameStats.id, GameStats.replay_hash).where(
+                GameStats.user_uid == uploader_uid,
+                GameStats.original_filename == original_name,
+                GameStats.is_final.is_(True),
+            )
+        )
+        previous_versions = [
+            row.id
+            for row in prior
+            if row.replay_hash != replay_hash
+        ]
+
+    game = GameStats(
+        user_uid=uploader_uid or "system",
+        replay_file=original_name,
+        replay_hash=replay_hash,
+        original_filename=original_name,
+        **game_kwargs,
+    )
+    db.add(game)
+    await db.flush()
+
+    if previous_versions:
+        await db.execute(
+            update(GameStats)
+            .where(GameStats.id.in_(previous_versions))
+            .values(
+                is_final=False,
+                parse_reason=SUPERSEDED_PARSE_REASON,
+            )
+        )
+
+    await _record_parse_attempt(
+        db,
+        user_uid=uploader_uid,
+        replay_hash=replay_hash,
+        original_filename=original_name,
+        parse_source=game_kwargs["parse_source"],
+        status="stored_final_metadata",
+        detail="Final replay stored with watcher metadata because replay parsing failed.",
+        upload_mode=upload_mode,
+        file_size_bytes=file_size_bytes,
+        game_stats_id=game.id,
+        played_on=game_kwargs["played_on"],
+    )
+    await db.commit()
+    return {
+        "message": "Final replay stored with watcher metadata.",
+        "replay_hash": replay_hash,
+        "winner": game_kwargs["winner"],
+        "players_count": len(game_kwargs["players"]),
+        "uploader_uid": uploader_uid,
+        "upload_mode": upload_mode,
+        "parse_iteration": parse_iteration,
+        "is_final": True,
+        "pending_parse": False,
+        "metadata_final": True,
+        "parse_reason": FINAL_METADATA_PARSE_REASON,
+    }
+
+
 def _key_event_chat_count(value):
     if isinstance(value, dict):
         return _coerce_positive_int(value.get("chat_count"))
@@ -811,6 +1371,19 @@ def _has_trusted_player_data(players: Optional[list], key_events: dict):
     return len(named_players) >= 2
 
 
+def _has_replay_trusted_player_data(players: Optional[list], key_events: dict):
+    if not _has_trusted_player_data(players, key_events):
+        return False
+    if isinstance(key_events, dict):
+        if key_events.get("replay_parser_trust") is False:
+            return False
+        if key_events.get("player_data_source") == "watcher_metadata":
+            return False
+        if key_events.get("bet_arming_eligible") is False:
+            return False
+    return True
+
+
 def _should_upgrade_duplicate_final(
     existing_game,
     incoming_parse_reason: Optional[str],
@@ -822,8 +1395,8 @@ def _should_upgrade_duplicate_final(
     existing_parse_reason = getattr(existing_game, "parse_reason", None)
 
     if (
-        existing_parse_reason == FINAL_UNPARSED_PARSE_REASON
-        and _has_trusted_player_data(incoming_players, incoming_key_events)
+        existing_parse_reason in {FINAL_UNPARSED_PARSE_REASON, FINAL_METADATA_PARSE_REASON}
+        and _has_replay_trusted_player_data(incoming_players, incoming_key_events)
     ):
         return True
 
@@ -1048,6 +1621,7 @@ async def parse_new_replay(
 @router.post("/replay/upload")
 async def upload_replay_file(
     file: UploadFile = File(...),
+    metadata: Optional[str] = Form(default=None),
     db_gen=Depends(get_db),
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
     user_uid: str = Header(default="system", alias="x-user-uid"),
@@ -1100,6 +1674,24 @@ async def upload_replay_file(
                 requested_reason=x_parse_reason,
                 parsed_reason=None,
             )
+            watcher_metadata_raw, watcher_metadata_error = _parse_watcher_metadata(
+                metadata,
+                replay_hash,
+            )
+            normalized_watcher_metadata = _normalize_watcher_metadata(
+                watcher_metadata_raw,
+                replay_hash=replay_hash,
+                original_name=original_name,
+                uploader_uid=uploader_uid,
+                file_size_bytes=written,
+            )
+            if watcher_metadata_error:
+                logging.warning(
+                    "⚠️ ignored watcher metadata for %s hash=%s: %s",
+                    original_name,
+                    replay_hash,
+                    watcher_metadata_error,
+                )
 
             parsed, parser_error = await parse_replay_full_with_error(
                 temp_path,
@@ -1179,9 +1771,23 @@ async def upload_replay_file(
 
                 if is_final_upload:
                     logging.warning(
-                        "⚠️ final replay parser failed; storing unparsed final row: "
+                        "⚠️ final replay parser failed; storing final fallback row: "
                         f"file={original_name} hash={replay_hash} parser_error={parser_error}"
                     )
+                    if _has_meaningful_watcher_metadata(normalized_watcher_metadata):
+                        return await _store_metadata_final_upload(
+                            db,
+                            uploader_uid=uploader_uid,
+                            replay_hash=replay_hash,
+                            original_name=original_name,
+                            parsed=None,
+                            parse_source=parse_source_hint,
+                            parser_error=parser_error or parse_failure_detail,
+                            parse_iteration=parse_iteration,
+                            upload_mode=mode,
+                            file_size_bytes=written,
+                            normalized_metadata=normalized_watcher_metadata,
+                        )
                     return await _store_unparsed_final_upload(
                         db,
                         uploader_uid=uploader_uid,
@@ -1258,6 +1864,20 @@ async def upload_replay_file(
                     f"player_error={key_events.get('player_extraction_error')} "
                     f"parse_reason={parse_reason}"
                 )
+                if _has_meaningful_watcher_metadata(normalized_watcher_metadata):
+                    return await _store_metadata_final_upload(
+                        db,
+                        uploader_uid=uploader_uid,
+                        replay_hash=replay_hash,
+                        original_name=original_name,
+                        parsed=parsed,
+                        parse_source=parse_source,
+                        parser_error=parser_error or parse_failure_detail,
+                        parse_iteration=parse_iteration,
+                        upload_mode=mode,
+                        file_size_bytes=written,
+                        normalized_metadata=normalized_watcher_metadata,
+                    )
                 return await _store_unparsed_final_upload(
                     db,
                     uploader_uid=uploader_uid,
