@@ -12,6 +12,7 @@ from routes.replay_routes_async import (
     _build_unparsed_final_game_kwargs,
     _derive_upload_parse_metadata,
     _extract_platform_match_id,
+    _has_meaningful_watcher_metadata,
     _has_reliable_final_signal,
     _has_replay_trusted_player_data,
     _infer_incomplete_uploader_outcome,
@@ -254,6 +255,131 @@ def test_parse_watcher_metadata_rejects_hash_mismatch():
     assert "replay_hash did not match" in error
 
 
+def test_thin_file_observation_metadata_is_not_meaningful_for_metadata_final():
+    replay_hash = "e" * 64
+    normalized = _normalize_watcher_metadata(
+        {
+            "schema": "aoe2dewarwagers.watcher_final_metadata.v2",
+            "version": 2,
+            "replay_hash": replay_hash,
+            "metadata_sources": ["watcher_file_observation"],
+            "session_id": "watcher-session",
+            "filename": "thin.aoe2record",
+            "started_at": "2026-04-22T18:30:00Z",
+            "ended_at": "2026-04-22T19:05:00Z",
+            "uploaded_at": "2026-04-22T19:06:00Z",
+            "file_size_bytes": 1154519,
+            "players": [],
+            "player_count": None,
+        },
+        replay_hash=replay_hash,
+        original_name="thin.aoe2record",
+        uploader_uid="user-1",
+        file_size_bytes=1154519,
+    )
+
+    assert normalized["session_id"] == "watcher-session"
+    assert not _has_meaningful_watcher_metadata(normalized)
+
+
+def test_enriched_watcher_metadata_preserves_de_runtime_context_without_roster_truth():
+    replay_hash = "f" * 64
+    normalized = _normalize_watcher_metadata(
+        {
+            "schema": "aoe2dewarwagers.watcher_final_metadata.v2",
+            "version": 2,
+            "replay_hash": replay_hash,
+            "metadata_sources": [
+                "watcher_file_observation",
+                "de_profile_context",
+                "de_session_data",
+                "steam_loginusers",
+                "de_log_candidate_lobby",
+            ],
+            "filename": "MP Replay v101.103.39862.0 @2026.04.22 183000.aoe2record",
+            "started_at": "2026-04-22T18:30:00Z",
+            "ended_at": "2026-04-22T19:05:30Z",
+            "game_version": {
+                "value": "101.103.39862.0",
+                "build": "170934",
+                "source": "Age2SessionData.txt",
+            },
+            "de_runtime": {
+                "profile_id": "76561198065420384",
+                "profile_source": "savegame_path",
+                "player_session_id": "rW3tBeqIJ0iJqmrmXcheQg==",
+                "player_session_source": "Age2SessionData.txt",
+                "config": "Retail",
+                "stream": "release_build_machine",
+            },
+            "local_player": {
+                "steam64": "76561198065420384",
+                "persona_name": "Emaren",
+                "source": "steam_loginusers",
+            },
+            "candidate_lobby_ids": [
+                {
+                    "id": "472207598",
+                    "source": "de_mainlog",
+                    "confidence": "low",
+                    "observed_at": "2026-04-22T18:45:12Z",
+                    "source_file": "logs/2026.04.22-1830.00/MainLog.txt",
+                    "line": 12,
+                }
+            ],
+            "players": [],
+            "player_count": None,
+            "trust": {
+                "trusted_player_data": False,
+                "winner": False,
+                "replay_parser": False,
+                "bet_arming_eligible": False,
+            },
+        },
+        replay_hash=replay_hash,
+        original_name="replay.aoe2record",
+        uploader_uid="user-1",
+        file_size_bytes=1154519,
+    )
+
+    assert _has_meaningful_watcher_metadata(normalized)
+    assert normalized["players"] == []
+    assert normalized["player_count"] == 0
+    assert normalized["lobby_id"] is None
+    assert normalized["local_player"]["persona_name"] == "Emaren"
+    assert normalized["de_runtime"]["player_session_id"] == "rW3tBeqIJ0iJqmrmXcheQg=="
+    assert normalized["game_version"]["value"] == "101.103.39862.0"
+    assert normalized["candidate_lobby_ids"][0]["confidence"] == "low"
+
+    fields = _build_metadata_final_game_kwargs(
+        parsed={
+            "winner": "Unknown",
+            "completed": False,
+            "key_events": {
+                "player_extraction_source": "no_players",
+                "player_extraction_error": "players -> ai_type failed",
+            },
+        },
+        normalized_metadata=normalized,
+        parse_source="watcher_final",
+        parser_error=None,
+        parse_iteration=4,
+    )
+
+    assert fields["parse_reason"] == FINAL_METADATA_PARSE_REASON
+    assert fields["game_version"] == "101.103.39862.0"
+    assert fields["winner"] == "Unknown"
+    assert fields["players"] == []
+    assert fields["key_events"]["player_extraction_source"] == "no_players"
+    assert fields["key_events"]["trusted_player_data"] is False
+    assert fields["key_events"]["bet_arming_eligible"] is False
+    watcher_metadata = fields["key_events"]["watcher_metadata"]
+    assert watcher_metadata["local_player"]["persona_name"] == "Emaren"
+    assert watcher_metadata["de_runtime"]["profile_id"] == "76561198065420384"
+    assert watcher_metadata["candidate_lobby_ids"][0]["id"] == "472207598"
+    assert watcher_metadata["game_version"]["build"] == "170934"
+
+
 def test_metadata_final_kwargs_keep_watcher_truth_separate_from_parser_truth():
     replay_hash = "a" * 64
     raw_metadata = {
@@ -476,6 +602,43 @@ def test_should_upgrade_unparsed_final_when_watcher_metadata_arrives():
             "key_events": {
                 "trusted_player_data": True,
                 "player_data_source": "watcher_metadata",
+            },
+        },
+    )
+
+
+def test_should_refresh_metadata_final_when_runtime_context_improves():
+    existing_game = SimpleNamespace(
+        parse_reason=FINAL_METADATA_PARSE_REASON,
+        winner="Unknown",
+        players=[],
+        disconnect_detected=False,
+        key_events={
+            "watcher_final_metadata": True,
+            "trusted_player_data": False,
+            "player_data_source": "watcher_metadata",
+            "watcher_metadata": {
+                "game_version": {"value": "101.103.39862.0"},
+            },
+        },
+        map={"name": "Unknown", "size": "Unknown"},
+    )
+
+    assert _should_refresh_watcher_metadata_final(
+        existing_game,
+        {
+            "winner": "Unknown",
+            "players": [],
+            "map": {"name": "Unknown", "size": "Unknown"},
+            "key_events": {
+                "trusted_player_data": False,
+                "player_data_source": "watcher_metadata",
+                "watcher_metadata": {
+                    "game_version": {"value": "101.103.39862.0"},
+                    "local_player": {"persona_name": "Emaren"},
+                    "de_runtime": {"player_session_id": "session"},
+                    "candidate_lobby_ids": [{"id": "472207598"}],
+                },
             },
         },
     )

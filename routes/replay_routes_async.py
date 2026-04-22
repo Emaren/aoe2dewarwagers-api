@@ -34,7 +34,7 @@ SUPERSEDED_PARSE_REASON = "superseded_by_later_upload"
 PLACEHOLDER_LIVE_PARSE_REASON = "watcher_live_pending_parse"
 FINAL_UNPARSED_PARSE_REASON = "watcher_final_unparsed"
 FINAL_METADATA_PARSE_REASON = "watcher_final_metadata"
-WATCHER_METADATA_SCHEMA = "aoe2dewarwagers.watcher_final_metadata.v1"
+WATCHER_METADATA_SCHEMA = "aoe2dewarwagers.watcher_final_metadata.v2"
 WATCHER_METADATA_MAX_CHARS = 64_000
 
 WATCHER_KEY_RE = re.compile(r"^wolo_([a-f0-9]{12})_(.+)$", re.IGNORECASE)
@@ -591,6 +591,106 @@ def _metadata_datetime(value):
     return None
 
 
+def _normalize_watcher_game_version(metadata: dict):
+    raw_value = metadata.get("game_version") or metadata.get("gameVersion")
+    if isinstance(raw_value, dict):
+        value = _clean_metadata_string(raw_value.get("value") or raw_value.get("version"), 50)
+        build = _clean_metadata_string(raw_value.get("build"), 40)
+        source = _clean_metadata_string(raw_value.get("source"), 80)
+    else:
+        value = _clean_metadata_string(raw_value, 50)
+        build = None
+        source = None
+
+    if not value:
+        return None
+
+    return {
+        "value": value,
+        "build": build,
+        "source": source or "watcher_metadata",
+    }
+
+
+def _normalize_local_player_metadata(metadata: dict):
+    raw_value = metadata.get("local_player") or metadata.get("localPlayer")
+    if not isinstance(raw_value, dict):
+        return None
+
+    steam64 = _clean_metadata_string(
+        raw_value.get("steam64") or raw_value.get("steam_id") or raw_value.get("profile_id"),
+        32,
+    )
+    persona_name = _clean_metadata_string(
+        raw_value.get("persona_name") or raw_value.get("personaName") or raw_value.get("name"),
+        120,
+    )
+    source = _clean_metadata_string(raw_value.get("source"), 80)
+    if not steam64 and not persona_name:
+        return None
+
+    normalized = {
+        "steam64": steam64,
+        "persona_name": persona_name,
+        "source": source or "watcher_metadata",
+    }
+    return {key: value for key, value in normalized.items() if value is not None}
+
+
+def _normalize_de_runtime_metadata(metadata: dict):
+    raw_value = metadata.get("de_runtime") or metadata.get("deRuntime")
+    if not isinstance(raw_value, dict):
+        return None
+
+    normalized = {
+        "profile_id": _clean_metadata_string(raw_value.get("profile_id") or raw_value.get("profileId"), 80),
+        "profile_source": _clean_metadata_string(raw_value.get("profile_source") or raw_value.get("profileSource"), 80),
+        "player_session_id": _clean_metadata_string(
+            raw_value.get("player_session_id") or raw_value.get("playerSessionId"),
+            120,
+        ),
+        "player_session_source": _clean_metadata_string(
+            raw_value.get("player_session_source") or raw_value.get("playerSessionSource"),
+            80,
+        ),
+        "config": _clean_metadata_string(raw_value.get("config"), 80),
+        "stream": _clean_metadata_string(raw_value.get("stream"), 120),
+    }
+    normalized = {key: value for key, value in normalized.items() if value is not None}
+    return normalized or None
+
+
+def _normalize_candidate_lobby_ids(metadata: dict):
+    raw_value = metadata.get("candidate_lobby_ids") or metadata.get("candidateLobbyIds")
+    if not isinstance(raw_value, list):
+        return []
+
+    candidates = []
+    seen = set()
+    for raw_candidate in raw_value:
+        if not isinstance(raw_candidate, dict):
+            continue
+
+        lobby_id = _clean_metadata_string(raw_candidate.get("id") or raw_candidate.get("lobby_id"), 120)
+        if not lobby_id or lobby_id in seen:
+            continue
+        seen.add(lobby_id)
+
+        observed_at = _metadata_datetime(raw_candidate.get("observed_at") or raw_candidate.get("observedAt"))
+        candidates.append(
+            {
+                "id": lobby_id,
+                "source": _clean_metadata_string(raw_candidate.get("source"), 80) or "watcher_metadata",
+                "confidence": _clean_metadata_string(raw_candidate.get("confidence"), 40) or "low",
+                "observed_at": observed_at.isoformat() if observed_at else None,
+                "source_file": _clean_metadata_string(raw_candidate.get("source_file"), 255),
+                "line": _coerce_positive_int(raw_candidate.get("line")) or None,
+            }
+        )
+
+    return candidates[:12]
+
+
 def _parse_watcher_metadata(raw_metadata: Optional[str], replay_hash: str):
     if not raw_metadata:
         return None, None
@@ -745,6 +845,11 @@ def _normalize_watcher_metadata(
     if not metadata_sources:
         metadata_sources = ["watcher_metadata"]
 
+    game_version = _normalize_watcher_game_version(metadata)
+    local_player = _normalize_local_player_metadata(metadata)
+    de_runtime = _normalize_de_runtime_metadata(metadata)
+    candidate_lobby_ids = _normalize_candidate_lobby_ids(metadata)
+
     trusted_player_data = (
         _coerce_optional_bool(trust.get("trusted_player_data") or trust.get("player_data")) is True
         and len(players) >= 2
@@ -763,6 +868,10 @@ def _normalize_watcher_metadata(
         "ended_at": ended_at,
         "uploaded_at": uploaded_at,
         "file_size_bytes": _coerce_positive_int(metadata.get("file_size_bytes")) or file_size_bytes,
+        "game_version": game_version,
+        "local_player": local_player,
+        "de_runtime": de_runtime,
+        "candidate_lobby_ids": candidate_lobby_ids,
         "players": players,
         "player_count": player_count or 0,
         "map": {
@@ -783,17 +892,28 @@ def _has_meaningful_watcher_metadata(normalized_metadata: Optional[dict]):
     if not isinstance(normalized_metadata, dict):
         return False
 
+    sources = set(normalized_metadata.get("metadata_sources") or [])
+    enrichment_sources = {
+        "de_profile_context",
+        "de_session_data",
+        "steam_loginusers",
+        "savegame_path",
+        "de_log_candidate_lobby",
+        "local_metadata_sidecar",
+        "replay_filename_version",
+    }
+
     return any(
         [
-            normalized_metadata.get("session_id"),
             normalized_metadata.get("lobby_id"),
-            normalized_metadata.get("started_at"),
-            normalized_metadata.get("ended_at"),
-            normalized_metadata.get("uploaded_at"),
-            normalized_metadata.get("file_size_bytes"),
+            normalized_metadata.get("game_version"),
+            normalized_metadata.get("local_player"),
+            normalized_metadata.get("de_runtime"),
+            normalized_metadata.get("candidate_lobby_ids"),
             normalized_metadata.get("player_count"),
             normalized_metadata.get("players"),
             normalized_metadata.get("map", {}).get("name") not in {None, "", "Unknown"},
+            bool(sources & enrichment_sources),
         ]
     )
 
@@ -840,6 +960,7 @@ def _build_metadata_final_game_kwargs(
         winner = "Unknown"
 
     replay_parser = _build_replay_parser_failure_snapshot(parsed_payload, parser_error)
+    watcher_game_version = normalized_metadata.get("game_version")
     key_events = {
         "completed": False,
         "postgame_available": False,
@@ -863,6 +984,10 @@ def _build_metadata_final_game_kwargs(
             "session_id": normalized_metadata.get("session_id"),
             "lobby_id": normalized_metadata.get("lobby_id"),
             "filename": normalized_metadata.get("filename"),
+            "game_version": watcher_game_version,
+            "de_runtime": normalized_metadata.get("de_runtime"),
+            "local_player": normalized_metadata.get("local_player"),
+            "candidate_lobby_ids": normalized_metadata.get("candidate_lobby_ids") or [],
             "started_at": started_at.isoformat() if started_at else None,
             "ended_at": ended_at.isoformat() if ended_at else None,
             "uploaded_at": normalized_metadata.get("uploaded_at").isoformat()
@@ -883,7 +1008,8 @@ def _build_metadata_final_game_kwargs(
         key_events["rated"] = normalized_metadata.get("rated")
 
     return {
-        "game_version": parsed_payload.get("game_version"),
+        "game_version": parsed_payload.get("game_version")
+        or (watcher_game_version or {}).get("value"),
         "map": normalized_metadata.get("map") or {"name": "Unknown", "size": "Unknown"},
         "game_type": normalized_metadata.get("game_type") or parsed_payload.get("game_type"),
         "duration": duration,
@@ -1143,6 +1269,27 @@ def _metadata_player_count_from_game(game):
     return 0
 
 
+def _watcher_metadata_enrichment_score(key_events: dict):
+    if not isinstance(key_events, dict):
+        return 0
+
+    watcher_metadata = key_events.get("watcher_metadata")
+    if not isinstance(watcher_metadata, dict):
+        return 0
+
+    score = 0
+    for key in ("game_version", "local_player", "de_runtime"):
+        if isinstance(watcher_metadata.get(key), dict) and watcher_metadata.get(key):
+            score += 1
+    if isinstance(watcher_metadata.get("candidate_lobby_ids"), list) and watcher_metadata.get("candidate_lobby_ids"):
+        score += 1
+    if watcher_metadata.get("players_known"):
+        score += 2
+    if watcher_metadata.get("map_known"):
+        score += 1
+    return score
+
+
 def _should_refresh_watcher_metadata_final(existing_game, incoming_game_kwargs: dict):
     existing_parse_reason = getattr(existing_game, "parse_reason", None)
     if existing_parse_reason == FINAL_UNPARSED_PARSE_REASON:
@@ -1152,6 +1299,9 @@ def _should_refresh_watcher_metadata_final(existing_game, incoming_game_kwargs: 
 
     existing_key_events = getattr(existing_game, "key_events", {}) or {}
     incoming_key_events = incoming_game_kwargs.get("key_events") or {}
+    if _watcher_metadata_enrichment_score(incoming_key_events) > _watcher_metadata_enrichment_score(existing_key_events):
+        return True
+
     existing_count = _metadata_player_count_from_game(existing_game)
     incoming_count = len(incoming_game_kwargs.get("players") or [])
     if incoming_count > existing_count:
