@@ -11,7 +11,7 @@ import config  # triggers layered .env loading
 # ────────────────────────────────────────────────────────────────
 raw_url = os.getenv(
     "DATABASE_URL",
-    "postgresql+asyncpg://aoe2hd_user:aoe2hd_pass@localhost:5432/aoe2hd_db"
+    "postgresql+asyncpg://aoe2de_user:aoe2de_pass@localhost:5432/aoe2de_db"
 ).strip()
 
 if raw_url.startswith("postgres://"):

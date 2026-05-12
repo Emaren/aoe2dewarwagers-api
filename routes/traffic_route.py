@@ -19,7 +19,7 @@ from routes.admin_routes_async import verify_admin_token
 
 router = APIRouter()
 
-DEFAULT_DEDICATED_LOG_PATH = "/var/log/nginx/aoe2hdbets.access.log"
+DEFAULT_DEDICATED_LOG_PATH = "/var/log/nginx/aoe2dewarwagers.access.log"
 DEFAULT_SHARED_LOG_PATH = "/var/log/nginx/access.log"
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPT_DIR = BASE_DIR / "scripts"
@@ -595,14 +595,14 @@ def counter_sum_for_aliases(counter, aliases):
 def get_primary_host_aliases():
     raw = os.getenv(
         "TRAFFIC_PRIMARY_HOST_ALIASES",
-        "aoe2hdbets.com,www.aoe2hdbets.com",
+        "aoe2dewarwagers.com,www.aoe2dewarwagers.com",
     )
     aliases = []
     for value in raw.split(","):
         normalized = normalize_host(value)
         if normalized and normalized not in aliases and normalized != UNKNOWN_HOST:
             aliases.append(normalized)
-    return aliases or ["aoe2hdbets.com"]
+    return aliases or ["aoe2dewarwagers.com"]
 
 
 def normalize_user_agent_key(ua):

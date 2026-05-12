@@ -6,13 +6,13 @@ Keep this file brutally practical: how to run the backend safely, how to run tes
 
 ## Runtime truth
 
-- VPS repo path: `/var/www/AoE2HDBets/api-prodn`
-- service: `aoe2hdbets-api.service`
-- bind: `127.0.0.1:3330`
+- VPS repo path: `/mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers/api-prodn`
+- service: `aoe2dewarwagers-api.service`
+- bind: `127.0.0.1:4400`
 - production exec:
 
 ```bash
-/var/www/AoE2HDBets/api-prodn/venv/bin/uvicorn app:app --host 127.0.0.1 --port 3330
+/mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers/api-prodn/venv/bin/uvicorn app:app --host 127.0.0.1 --port 4400
 ```
 
 ## Local setup
@@ -22,7 +22,7 @@ The repo currently has multiple Python env hints. Do not assume `pytest` is on t
 Use an explicit venv:
 
 ```bash
-cd /Users/tonyblum/projects/AoE2HDBets/api-prodn
+cd /Users/tonyblum/projects/AoE2DEWarWagers/api-prodn
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -41,9 +41,9 @@ The actual app entrypoint is `app:app`.
 Suggested local run:
 
 ```bash
-cd /Users/tonyblum/projects/AoE2HDBets/api-prodn
+cd /Users/tonyblum/projects/AoE2DEWarWagers/api-prodn
 source .venv-codex/bin/activate
-uvicorn app:app --reload --host 127.0.0.1 --port 3330
+uvicorn app:app --reload --host 127.0.0.1 --port 4400
 ```
 
 Older scripts and README references still mention ports like `8002` and `8003`. Those are legacy/dev leftovers, not current production truth.
@@ -53,7 +53,7 @@ Older scripts and README references still mention ports like `8002` and `8003`. 
 Preferred:
 
 ```bash
-cd /Users/tonyblum/projects/AoE2HDBets/api-prodn
+cd /Users/tonyblum/projects/AoE2DEWarWagers/api-prodn
 source .venv-codex/bin/activate
 pytest -q
 ```

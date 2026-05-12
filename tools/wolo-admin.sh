@@ -29,7 +29,7 @@ check_sync() {
 
 api_healthcheck() {
   echo "Pinging API Gateway..."
-  curl -I https://api.aoe2hdbets.com | grep HTTP
+  curl -I https://api.aoe2dewarwagers.com | grep HTTP
 }
 
 port_check() {

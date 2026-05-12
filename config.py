@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 env_loaded = False
-logger = logging.getLogger("aoe2hdbets.config")
+logger = logging.getLogger("aoe2dewarwagers.config")
 
 def _resolve_env(default: str = "development") -> str:
     current = os.getenv("ENV")

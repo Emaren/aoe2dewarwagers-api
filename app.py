@@ -28,7 +28,7 @@ from routes import (
 )
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
-logger = logging.getLogger("aoe2hdbets.api")
+logger = logging.getLogger("aoe2dewarwagers.api")
 
 
 def _read_platform_match_id(game: GameStats) -> str | None:
@@ -71,9 +71,9 @@ def _parse_allowed_origins() -> list[str]:
             "http://localhost:3001",
             "http://localhost:3002",
             "https://aoe2-betting.vercel.app",
-            "https://aoe2hdbets.com",
-            "https://www.aoe2hdbets.com",
-            "https://app-staging.aoe2hdbets.com",
+            "https://aoe2dewarwagers.com",
+            "https://www.aoe2dewarwagers.com",
+            "https://app-staging.aoe2dewarwagers.com",
         ]
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 

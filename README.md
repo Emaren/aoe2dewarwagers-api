@@ -1,10 +1,10 @@
 # api-prodn
 
-Production FastAPI backend for AoE2HDBets.
+Production FastAPI backend for AoE2DEWarWagers.
 
 ## Canonical docs
 
-- [TESTING.md](/Users/tonyblum/projects/AoE2HDBets/api-prodn/TESTING.md)
+- [TESTING.md](/Users/tonyblum/projects/AoE2DEWarWagers/api-prodn/TESTING.md)
 
 ## Responsibilities
 
@@ -36,7 +36,7 @@ Production FastAPI backend for AoE2HDBets.
 - traffic diagnostics data
 - requires admin bearer token (`ADMIN_TOKEN`)
 - uses a short in-process response cache (`TRAFFIC_RESPONSE_CACHE_SECONDS`, default 20s) to avoid rebuilding the full nginx tail + geo summary on every poll
-- reads the dedicated AoE2 nginx log first (`/var/log/nginx/aoe2hdbets.access.log`) and falls back to the shared nginx access log only if needed
+- reads the dedicated AoE2 nginx log first (`/var/log/nginx/aoe2dewarwagers.access.log`) and falls back to the shared nginx access log only if needed
 
 ### `GET /api/game_stats`
 
@@ -51,7 +51,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 alembic upgrade head
-uvicorn app:app --reload --host 127.0.0.1 --port 3330
+uvicorn app:app --reload --host 127.0.0.1 --port 4400
 ```
 
 ## Environment
@@ -70,10 +70,10 @@ Optional/common:
 - `CHAIN_ID`
 - `ALLOWED_ORIGINS`
 - `TRAFFIC_STATE_DIR` (default: `runtime/` in repo root)
-- `AOE2_TRAFFIC_LOG_PATH` (preferred override for the AoE2 local traffic diagnostics reader; defaults to `/var/log/nginx/aoe2hdbets.access.log` with fallback to `/var/log/nginx/access.log`)
+- `AOE2_TRAFFIC_LOG_PATH` (preferred override for the AoE2 local traffic diagnostics reader; defaults to `/var/log/nginx/aoe2dewarwagers.access.log` with fallback to `/var/log/nginx/access.log`)
 - `TRAFFIC_LOG_PATH` (legacy-compatible fallback override for the same AoE2 diagnostics reader)
 - `TRAFFIC_RESPONSE_CACHE_SECONDS` (default: `20`; set `0` to disable the in-process `/api/traffic` response cache)
-- `AOE2_API_BASE_URL` (used by `parse_replay.py` for non-local targets; default `https://api-prodn.aoe2hdbets.com`)
+- `AOE2_API_BASE_URL` (used by `parse_replay.py` for non-local targets; default `https://api-prodn.aoe2dewarwagers.com`)
 - `LOG_REQUESTS=true` to enable request-line logging (disabled by default in production)
 - `ENABLE_TRACE_LOGS=true` to emit replay `.trace` files and `trace.index` while debugging replay behavior
 - `ALLOW_UNVERIFIED_BEARER_IDENTITY=true` only for legacy compatibility; keep disabled in production
@@ -107,9 +107,9 @@ Local MBP -> push `main` -> VPS pull `main` -> restart service
 
 ## Production runtime truth
 
-- VPS repo path: `/var/www/AoE2HDBets/api-prodn`
-- service: `aoe2hdbets-api.service`
-- production bind: `127.0.0.1:3330`
+- VPS repo path: `/mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers/api-prodn`
+- service: `aoe2dewarwagers-api.service`
+- production bind: `127.0.0.1:4400`
 - production entrypoint: `uvicorn app:app`
 
 ## Admin bootstrap

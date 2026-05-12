@@ -5,13 +5,13 @@ import subprocess
 
 repos = {
     "local": {
-        "app-prodn": "/Users/tonyblum/projects/AoE2HDBets/app-prodn",
-        "api-prodn": "/Users/tonyblum/projects/AoE2HDBets/api-prodn",
-        "aoe2-watcher": "/Users/tonyblum/projects/AoE2HDBets/aoe2-watcher",
+        "app-prodn": "/Users/tonyblum/projects/AoE2DEWarWagers/app-prodn",
+        "api-prodn": "/Users/tonyblum/projects/AoE2DEWarWagers/api-prodn",
+        "aoe2de-watcher": "/Users/tonyblum/projects/AoE2DEWarWagers/aoe2de-watcher",
     },
     "vps-prod": {
-        "app-prodn": "/var/www/AoE2HDBets/app-prodn",
-        "api-prodn": "/var/www/AoE2HDBets/api-prodn",
+        "app-prodn": "/mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers/app-prodn",
+        "api-prodn": "/mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers/api-prodn",
     },
 }
 

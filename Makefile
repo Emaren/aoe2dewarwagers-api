@@ -1,4 +1,4 @@
-# Makefile for AoE2HD Parsing App 🧠
+# Makefile for AoE2DE Parsing App 🧠
 PYTHONPATH := $(shell pwd)
 
 # ─────────────────────────────
@@ -105,10 +105,10 @@ all:
 	cd ../app-prodn && npm run dev
 
 frontend-tab:
-	osascript -e 'tell app "Terminal" to do script "cd ~/projects/AoE2HDBets/app-prodn && npm run dev"'
+	osascript -e 'tell app "Terminal" to do script "cd ~/projects/AoE2DEWarWagers/app-prodn && npm run dev"'
 
 backend-tab:
-	osascript -e 'tell app "Terminal" to do script "cd ~/projects/AoE2HDBets/api-prodn && ENV_FILE=$(ENV_FILE) ./run_local.sh"'
+	osascript -e 'tell app "Terminal" to do script "cd ~/projects/AoE2DEWarWagers/api-prodn && ENV_FILE=$(ENV_FILE) ./run_local.sh"'
 
 # ─────────────────────────────
 # 🔖 GIT TAG HELPER

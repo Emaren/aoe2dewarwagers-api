@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-$HOME/projects/AoE2HDBets}"
+ROOT_DIR="${ROOT_DIR:-$HOME/projects/AoE2DEWarWagers}"
 REPOS=("app-prodn" "api-prodn" "aoe2-watcher")
 BRANCH="${BRANCH:-main}"
 
@@ -36,7 +36,7 @@ for repo in "${REPOS[@]}"; do
 done
 
 if [[ -n "${VPS_HOST:-}" ]]; then
-  VPS_PATH="${VPS_PATH:-/var/www/AoE2HDBets}"
+  VPS_PATH="${VPS_PATH:-/mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers}"
   echo "⇣ Pulling latest on VPS: $VPS_HOST ($VPS_PATH)"
   ssh "$VPS_HOST" "\
     set -euo pipefail; \
@@ -48,8 +48,8 @@ if [[ -n "${VPS_HOST:-}" ]]; then
 else
   cat <<EOF
 No VPS host configured. To pull on your VPS manually:
-  cd /var/www/AoE2HDBets/app-prodn && git pull --ff-only origin $BRANCH
-  cd /var/www/AoE2HDBets/api-prodn && git pull --ff-only origin $BRANCH
+  cd /mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers/app-prodn && git pull --ff-only origin $BRANCH
+  cd /mnt/HC_Volume_105319120/www-moved/AoE2DEWarWagers/api-prodn && git pull --ff-only origin $BRANCH
 
 Watcher source stays local on MBP.
 VPS should only host the built watcher artifacts in app-prodn/public/downloads.

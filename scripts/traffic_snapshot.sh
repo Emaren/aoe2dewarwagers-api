@@ -1,6 +1,6 @@
 #!/bin/bash
 
-LOG_FILE="${AOE2_TRAFFIC_LOG_PATH:-${TRAFFIC_LOG_PATH:-/var/log/nginx/aoe2hdbets.access.log}}"
+LOG_FILE="${AOE2_TRAFFIC_LOG_PATH:-${TRAFFIC_LOG_PATH:-/var/log/nginx/aoe2dewarwagers.access.log}}"
 FALLBACK_LOG_FILE="/var/log/nginx/access.log"
 
 if [ ! -f "$LOG_FILE" ] && [ -f "$FALLBACK_LOG_FILE" ]; then
