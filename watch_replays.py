@@ -5,6 +5,7 @@ import threading
 import platform
 import hashlib
 import asyncio
+import glob
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
@@ -177,24 +178,32 @@ def default_dirs():
     paths = ["/replays"]
     if system == "Windows":
         u = os.environ.get("USERPROFILE", "")
-        paths += [os.path.join(u, p) for p in [
-            "Documents/My Games/Age of Empires 2 HD/SaveGame",
-            "Documents/My Games/Age of Empires 2 DE/SaveGame"
-        ]]
+        patterns = [
+            os.path.join(u, "Games/Age of Empires 2 DE/*/savegame"),
+            os.path.join(u, "AppData/Local/Games/Age of Empires 2 DE/*/savegame"),
+            os.path.join(u, "Documents/My Games/Age of Empires 2 DE/*/savegame"),
+        ]
     elif system == "Darwin":
-        paths += [
+        patterns = [
+            os.path.join(home, "Documents/My Games/Age of Empires 2 DE/SaveGame"),
             os.path.join(
                 home,
-                "Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Age2HD/SaveGame",
+                "Library/Application Support/CrossOver/Bottles/*/drive_c/users/*/Games/Age of Empires 2 DE/*/savegame",
             ),
-            os.path.join(home, "Documents/My Games/Age of Empires 2 DE/SaveGame"),
         ]
     else:
-        paths += [os.path.join(home, p) for p in [
-            ".wine/drive_c/Program Files (x86)/Microsoft Games/Age of Empires II HD/SaveGame",
-            "Documents/My Games/Age of Empires 2 HD/SaveGame"
-        ]]
-    return [d for d in paths if os.path.isdir(d)]
+        patterns = [
+            os.path.join(home, "Documents/My Games/Age of Empires 2 DE/*/savegame"),
+            os.path.join(
+                home,
+                ".steam/steam/steamapps/compatdata/813780/pfx/drive_c/users/*/Games/Age of Empires 2 DE/*/savegame",
+            ),
+        ]
+
+    for pattern in patterns:
+        paths.extend(glob.glob(pattern))
+
+    return list(dict.fromkeys(d for d in paths if os.path.isdir(d)))
 
 # ───────────────────────────────────────────────
 # 🚀 Entrypoint

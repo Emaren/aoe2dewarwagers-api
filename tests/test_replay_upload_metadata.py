@@ -9,10 +9,12 @@ from routes.replay_routes_async import (
     FINAL_METADATA_REFRESH_STATUS,
     FINAL_METADATA_PARSE_REASON,
     FINAL_UNPARSED_PARSE_REASON,
+    FINALITY_LIVE_PENDING_PARSE,
     _build_metadata_final_game_kwargs,
     _build_unparsed_final_game_kwargs,
     _derive_upload_parse_metadata,
     _extract_platform_match_id,
+    _finality_response,
     _has_meaningful_watcher_metadata,
     _has_reliable_final_signal,
     _has_replay_trusted_player_data,
@@ -25,6 +27,7 @@ from routes.replay_routes_async import (
     _should_refresh_watcher_metadata_final,
     _should_upgrade_duplicate_final,
     _should_refresh_reviewed_match,
+    _watcher_upload_metadata,
 )
 
 
@@ -46,6 +49,38 @@ def test_parse_positive_int_header_uses_positive_values_only():
     assert _parse_positive_int_header("0", 1) == 1
     assert _parse_positive_int_header("-7", 2) == 2
     assert _parse_positive_int_header("abc", 4) == 4
+
+
+def test_watcher_upload_metadata_sanitizes_native_watcher_headers():
+    assert _watcher_upload_metadata(
+        watcher_id=" watcher-abc ",
+        watcher_session_id=" session-123 ",
+        replay_fingerprint=" fp-456 ",
+        file_size_bytes="98765",
+        file_mtime_ms="1712345678901",
+        final_candidate="true",
+    ) == {
+        "watcher_id": "watcher-abc",
+        "watcher_session_id": "session-123",
+        "replay_fingerprint": "fp-456",
+        "file_size_bytes": 98765,
+        "file_mtime_ms": 1712345678901,
+        "final_candidate": True,
+    }
+
+
+def test_finality_response_exposes_explicit_watcher_contract():
+    assert _finality_response(
+        {"message": "stored"},
+        finality_status=FINALITY_LIVE_PENDING_PARSE,
+        pending_parse=True,
+    ) == {
+        "message": "stored",
+        "finality_status": FINALITY_LIVE_PENDING_PARSE,
+        "should_settle": False,
+        "pending_parse": True,
+        "unparsed_final": False,
+    }
 
 
 def test_derive_upload_parse_metadata_prefers_watcher_live_defaults():
@@ -183,6 +218,21 @@ def test_has_reliable_final_signal_rejects_paused_unknown_replay():
             "key_events": {
                 "completed": False,
                 "postgame_available": False,
+            },
+        }
+    )
+
+
+def test_has_reliable_final_signal_rejects_header_only_identity_without_result():
+    assert not _has_reliable_final_signal(
+        {
+            "winner": "Unknown",
+            "players": [{"name": "Emaren"}, {"name": "Sniper"}],
+            "duration": 1200,
+            "key_events": {
+                "completed": False,
+                "player_extraction_source": "header_fallback",
+                "player_count": 2,
             },
         }
     )

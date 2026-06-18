@@ -1,10 +1,10 @@
-"""Setup for AoE2 Betting Client and mgz_hd Replay Parser."""
+"""Setup for the AoE2DEWarWagers replay parser and helper client."""
 from setuptools import setup, find_packages
 
 setup(
     name='aoe2-betting-client',
     version='0.1.0',
-    description='Parse Age of Empires 2 HD recorded games and integrate with a betting dapp.',
+    description='Parse Age of Empires II: Definitive Edition recorded games for AoE2DEWarWagers.',
     url='https://github.com/Emaren/api-prodn',
     license='MIT',
     author='Emaren',

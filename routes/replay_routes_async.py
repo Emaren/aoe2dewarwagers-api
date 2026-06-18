@@ -37,6 +37,15 @@ FINAL_METADATA_PARSE_REASON = "watcher_final_metadata"
 FINAL_METADATA_REFRESH_STATUS = "final_metadata_refreshed"
 WATCHER_METADATA_SCHEMA = "aoe2dewarwagers.watcher_final_metadata.v2"
 WATCHER_METADATA_MAX_CHARS = 64_000
+FINALITY_LIVE = "live"
+FINALITY_LIVE_PENDING_PARSE = "live_pending_parse"
+FINALITY_FINAL_NOT_READY = "final_not_ready"
+FINALITY_FINAL_UNPARSED_PROOF = "final_unparsed_proof"
+FINALITY_TRUSTED_FINAL = "trusted_final"
+FINALITY_TRUSTED_FINAL_DUPLICATE = "trusted_final_duplicate"
+FINALITY_TRUSTED_FINAL_REFRESHED = "trusted_final_refreshed"
+FINALITY_REVIEWED_MATCH_DUPLICATE = "reviewed_match_duplicate"
+FINALITY_REVIEWED_MATCH_REFRESHED = "reviewed_match_refreshed"
 
 WATCHER_KEY_RE = re.compile(r"^wolo_([a-f0-9]{12})_(.+)$", re.IGNORECASE)
 
@@ -126,6 +135,71 @@ def _parse_positive_int_header(value: Optional[str], default: int = 1) -> int:
         return default
 
     return parsed if parsed > 0 else default
+
+
+def _clean_header_string(value: Optional[str], max_length: int = 120) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split()).strip()
+    return cleaned[:max_length] if cleaned else None
+
+
+def _finality_response(
+    payload: dict,
+    *,
+    finality_status: str,
+    should_settle: bool = False,
+    pending_parse: bool = False,
+    unparsed_final: bool = False,
+):
+    return {
+        **payload,
+        "finality_status": finality_status,
+        "should_settle": bool(should_settle),
+        "pending_parse": bool(pending_parse),
+        "unparsed_final": bool(unparsed_final),
+    }
+
+
+def _stored_final_should_settle(game) -> bool:
+    if not bool(getattr(game, "is_final", False)):
+        return False
+    return getattr(game, "parse_reason", None) not in {
+        FINAL_UNPARSED_PARSE_REASON,
+        FINAL_METADATA_PARSE_REASON,
+    }
+
+
+def _watcher_upload_metadata(
+    *,
+    watcher_id: Optional[str],
+    watcher_session_id: Optional[str],
+    replay_fingerprint: Optional[str],
+    file_size_bytes: Optional[str],
+    file_mtime_ms: Optional[str],
+    final_candidate: Optional[str],
+) -> dict:
+    metadata = {}
+    cleaned_watcher_id = _clean_header_string(watcher_id, 80)
+    cleaned_session_id = _clean_header_string(watcher_session_id, 120)
+    cleaned_fingerprint = _clean_header_string(replay_fingerprint, 120)
+    parsed_file_size = _parse_positive_int_header(file_size_bytes, 0)
+    parsed_mtime = _parse_positive_int_header(file_mtime_ms, 0)
+
+    if cleaned_watcher_id:
+        metadata["watcher_id"] = cleaned_watcher_id
+    if cleaned_session_id:
+        metadata["watcher_session_id"] = cleaned_session_id
+    if cleaned_fingerprint:
+        metadata["replay_fingerprint"] = cleaned_fingerprint
+    if parsed_file_size > 0:
+        metadata["file_size_bytes"] = parsed_file_size
+    if parsed_mtime > 0:
+        metadata["file_mtime_ms"] = parsed_mtime
+    if final_candidate is not None:
+        metadata["final_candidate"] = _parse_bool_header(final_candidate, False)
+
+    return metadata
 
 
 def _derive_upload_parse_metadata(
@@ -526,12 +600,6 @@ def _has_reliable_final_signal(parsed: dict, inferred_outcome: Optional[dict] = 
         if cleaned_winner and cleaned_winner != "Unknown":
             return True
 
-    player_source = str(key_events.get("player_extraction_source") or "").strip()
-    player_count = _coerce_positive_int(key_events.get("player_count"))
-    duration = _coerce_positive_int(parsed.get("duration") or parsed.get("game_duration"))
-    if player_source in {"header_fallback", "fast_header_fallback"} and player_count >= 2 and duration >= 60:
-        return True
-
     return False
 
 
@@ -886,6 +954,9 @@ def _normalize_watcher_metadata(
         "trusted_player_data": trusted_player_data,
         "metadata_sources": metadata_sources,
         "local_sidecar_filename": _clean_metadata_string(metadata.get("local_sidecar_filename"), 255),
+        "watcher_upload": metadata.get("watcher_upload")
+        if isinstance(metadata.get("watcher_upload"), dict)
+        else None,
     }
 
 
@@ -1002,6 +1073,7 @@ def _build_metadata_final_game_kwargs(
             "winner_reliable": bool(normalized_metadata.get("winner_reliable")),
             "trusted_player_data": trusted_player_data,
             "local_sidecar_filename": normalized_metadata.get("local_sidecar_filename"),
+            "watcher_upload": normalized_metadata.get("watcher_upload"),
         },
         "replay_parser": replay_parser,
     }
@@ -1068,6 +1140,7 @@ def _build_unparsed_final_game_kwargs(
     parse_source: str,
     parser_error: Optional[str],
     parse_iteration: int,
+    watcher_upload: Optional[dict] = None,
 ):
     parsed_payload = parsed if isinstance(parsed, dict) else {}
     map_info = parsed_payload.get("map") if isinstance(parsed_payload.get("map"), dict) else {}
@@ -1099,6 +1172,8 @@ def _build_unparsed_final_game_kwargs(
             "final_unparsed": True,
         }
     )
+    if watcher_upload:
+        key_events["watcher_upload"] = watcher_upload
 
     return {
         "game_version": parsed_payload.get("game_version"),
@@ -1136,12 +1211,14 @@ async def _store_unparsed_final_upload(
     parse_iteration: int,
     upload_mode: str,
     file_size_bytes: Optional[int],
+    watcher_upload: Optional[dict] = None,
 ):
     game_kwargs = _build_unparsed_final_game_kwargs(
         parsed=parsed,
         parse_source=parse_source,
         parser_error=parser_error,
         parse_iteration=parse_iteration,
+        watcher_upload=watcher_upload,
     )
 
     existing_final_game = await _load_existing_final_by_replay_hash(db, replay_hash)
@@ -1833,6 +1910,12 @@ async def upload_replay_file(
     x_is_final: Optional[str] = Header(default=None, alias="x-is-final"),
     x_parse_source: Optional[str] = Header(default=None, alias="x-parse-source"),
     x_parse_reason: Optional[str] = Header(default=None, alias="x-parse-reason"),
+    x_watcher_id: Optional[str] = Header(default=None, alias="x-watcher-id"),
+    x_watcher_session_id: Optional[str] = Header(default=None, alias="x-watcher-session-id"),
+    x_replay_fingerprint: Optional[str] = Header(default=None, alias="x-replay-fingerprint"),
+    x_file_size_bytes: Optional[str] = Header(default=None, alias="x-file-size-bytes"),
+    x_file_mtime_ms: Optional[str] = Header(default=None, alias="x-file-mtime-ms"),
+    x_final_candidate: Optional[str] = Header(default=None, alias="x-final-candidate"),
 ):
     original_name = file.filename or "replay.aoe2record"
     suffix = Path(original_name).suffix.lower()
@@ -1870,6 +1953,14 @@ async def upload_replay_file(
             uploader_user = await _load_user_by_uid(db, uploader_uid)
             is_final_upload = _parse_bool_header(x_is_final, True)
             parse_iteration = _parse_positive_int_header(x_parse_iteration, 1)
+            watcher_upload = _watcher_upload_metadata(
+                watcher_id=x_watcher_id,
+                watcher_session_id=x_watcher_session_id,
+                replay_fingerprint=x_replay_fingerprint,
+                file_size_bytes=x_file_size_bytes,
+                file_mtime_ms=x_file_mtime_ms,
+                final_candidate=x_final_candidate,
+            )
             parse_source_hint, _ = _derive_upload_parse_metadata(
                 upload_mode=mode,
                 is_final=is_final_upload,
@@ -1881,6 +1972,9 @@ async def upload_replay_file(
                 metadata,
                 replay_hash,
             )
+            if watcher_upload:
+                watcher_metadata_raw = dict(watcher_metadata_raw or {})
+                watcher_metadata_raw["watcher_upload"] = watcher_upload
             normalized_watcher_metadata = _normalize_watcher_metadata(
                 watcher_metadata_raw,
                 replay_hash=replay_hash,
@@ -1906,6 +2000,8 @@ async def upload_replay_file(
                         "completed": False,
                         "live_pending_parse": True,
                     }
+                    if watcher_upload:
+                        placeholder_key_events["watcher_upload"] = watcher_upload
                     existing_placeholder_live = await _load_existing_placeholder_live_game(
                         db,
                         uploader_uid,
@@ -1962,15 +2058,18 @@ async def upload_replay_file(
                         game_stats_id=existing_placeholder_live.id,
                     )
                     await db.commit()
-                    return {
-                        "message": "Replay detected early; placeholder live session stored.",
-                        "replay_hash": replay_hash,
-                        "uploader_uid": uploader_uid,
-                        "upload_mode": mode,
-                        "parse_iteration": parse_iteration,
-                        "is_final": False,
-                        "pending_parse": True,
-                    }
+                    return _finality_response(
+                        {
+                            "message": "Replay detected early; placeholder live session stored.",
+                            "replay_hash": replay_hash,
+                            "uploader_uid": uploader_uid,
+                            "upload_mode": mode,
+                            "parse_iteration": parse_iteration,
+                            "is_final": False,
+                        },
+                        finality_status=FINALITY_LIVE_PENDING_PARSE,
+                        pending_parse=True,
+                    )
 
                 if is_final_upload:
                     logging.warning(
@@ -1978,7 +2077,7 @@ async def upload_replay_file(
                         f"file={original_name} hash={replay_hash} parser_error={parser_error}"
                     )
                     if _has_meaningful_watcher_metadata(normalized_watcher_metadata):
-                        return await _store_metadata_final_upload(
+                        payload = await _store_metadata_final_upload(
                             db,
                             uploader_uid=uploader_uid,
                             replay_hash=replay_hash,
@@ -1991,7 +2090,12 @@ async def upload_replay_file(
                             file_size_bytes=written,
                             normalized_metadata=normalized_watcher_metadata,
                         )
-                    return await _store_unparsed_final_upload(
+                        return _finality_response(
+                            payload,
+                            finality_status=FINALITY_FINAL_UNPARSED_PROOF,
+                            unparsed_final=True,
+                        )
+                    payload = await _store_unparsed_final_upload(
                         db,
                         uploader_uid=uploader_uid,
                         replay_hash=replay_hash,
@@ -2002,6 +2106,12 @@ async def upload_replay_file(
                         parse_iteration=parse_iteration,
                         upload_mode=mode,
                         file_size_bytes=written,
+                        watcher_upload=watcher_upload,
+                    )
+                    return _finality_response(
+                        payload,
+                        finality_status=FINALITY_FINAL_UNPARSED_PROOF,
+                        unparsed_final=True,
                     )
 
                 await _record_parse_attempt(
@@ -2026,6 +2136,9 @@ async def upload_replay_file(
             players = parsed.get("players") if isinstance(parsed.get("players"), list) else []
             event_types = parsed.get("event_types") if isinstance(parsed.get("event_types"), list) else []
             key_events = parsed.get("key_events") if isinstance(parsed.get("key_events"), dict) else {}
+            if watcher_upload:
+                key_events = dict(key_events)
+                key_events["watcher_upload"] = watcher_upload
             winner = parsed.get("winner") or "Unknown"
             raw_duration = parsed.get("duration") or parsed.get("game_duration") or 0
             duration = int(raw_duration) if isinstance(raw_duration, (int, float)) else 0
@@ -2068,7 +2181,7 @@ async def upload_replay_file(
                     f"parse_reason={parse_reason}"
                 )
                 if _has_meaningful_watcher_metadata(normalized_watcher_metadata):
-                    return await _store_metadata_final_upload(
+                    payload = await _store_metadata_final_upload(
                         db,
                         uploader_uid=uploader_uid,
                         replay_hash=replay_hash,
@@ -2081,7 +2194,11 @@ async def upload_replay_file(
                         file_size_bytes=written,
                         normalized_metadata=normalized_watcher_metadata,
                     )
-                return await _store_unparsed_final_upload(
+                    return _finality_response(
+                        payload,
+                        finality_status=FINALITY_FINAL_NOT_READY,
+                    )
+                payload = await _store_unparsed_final_upload(
                     db,
                     uploader_uid=uploader_uid,
                     replay_hash=replay_hash,
@@ -2092,6 +2209,11 @@ async def upload_replay_file(
                     parse_iteration=parse_iteration,
                     upload_mode=mode,
                     file_size_bytes=written,
+                    watcher_upload=watcher_upload,
+                )
+                return _finality_response(
+                    payload,
+                    finality_status=FINALITY_FINAL_NOT_READY,
                 )
 
             if not is_final_upload:
@@ -2134,16 +2256,19 @@ async def upload_replay_file(
                         played_on=played_on,
                     )
                     await db.commit()
-                    return {
-                        "message": f"Replay iteration {parse_iteration} parsed and replaced placeholder live session.",
-                        "replay_hash": replay_hash,
-                        "winner": winner,
-                        "players_count": len(players),
-                        "uploader_uid": uploader_uid,
-                        "upload_mode": mode,
-                        "parse_iteration": parse_iteration,
-                        "is_final": False,
-                    }
+                    return _finality_response(
+                        {
+                            "message": f"Replay iteration {parse_iteration} parsed and replaced placeholder live session.",
+                            "replay_hash": replay_hash,
+                            "winner": winner,
+                            "players_count": len(players),
+                            "uploader_uid": uploader_uid,
+                            "upload_mode": mode,
+                            "parse_iteration": parse_iteration,
+                            "is_final": False,
+                        },
+                        finality_status=FINALITY_LIVE,
+                    )
 
             existing_final_game = await _load_existing_final_by_replay_hash(db, replay_hash)
             if existing_final_game:
@@ -2188,14 +2313,18 @@ async def upload_replay_file(
                         played_on=played_on,
                     )
                     await db.commit()
-                    return {
-                        "message": "Replay final refreshed with clearer completion metadata.",
-                        "replay_hash": replay_hash,
-                        "uploader_uid": uploader_uid,
-                        "upload_mode": mode,
-                        "parse_iteration": parse_iteration,
-                        "is_final": True,
-                    }
+                    return _finality_response(
+                        {
+                            "message": "Replay final refreshed with clearer completion metadata.",
+                            "replay_hash": replay_hash,
+                            "uploader_uid": uploader_uid,
+                            "upload_mode": mode,
+                            "parse_iteration": parse_iteration,
+                            "is_final": True,
+                        },
+                        finality_status=FINALITY_TRUSTED_FINAL_REFRESHED,
+                        should_settle=True,
+                    )
 
                 await _record_parse_attempt(
                     db,
@@ -2211,12 +2340,22 @@ async def upload_replay_file(
                     played_on=played_on,
                 )
                 await db.commit()
-                return {
-                    "message": "Replay already parsed as final. Skipped.",
-                    "replay_hash": replay_hash,
-                    "uploader_uid": uploader_uid,
-                    "upload_mode": mode,
-                }
+                should_settle = _stored_final_should_settle(existing_final_game)
+                return _finality_response(
+                    {
+                        "message": "Replay already parsed as final. Skipped.",
+                        "replay_hash": replay_hash,
+                        "uploader_uid": uploader_uid,
+                        "upload_mode": mode,
+                    },
+                    finality_status=(
+                        FINALITY_TRUSTED_FINAL_DUPLICATE
+                        if should_settle
+                        else FINALITY_FINAL_UNPARSED_PROOF
+                    ),
+                    should_settle=should_settle,
+                    unparsed_final=not should_settle,
+                )
 
             platform_match_id = _extract_platform_match_id(key_events)
             if is_final_upload:
@@ -2272,15 +2411,19 @@ async def upload_replay_file(
                             played_on=played_on,
                         )
                         await db.commit()
-                        return {
-                            "message": "Reviewed match refreshed with later final replay data.",
-                            "replay_hash": replay_hash,
-                            "platform_match_id": platform_match_id,
-                            "uploader_uid": uploader_uid,
-                            "upload_mode": mode,
-                            "parse_iteration": parse_iteration,
-                            "is_final": True,
-                        }
+                        return _finality_response(
+                            {
+                                "message": "Reviewed match refreshed with later final replay data.",
+                                "replay_hash": replay_hash,
+                                "platform_match_id": platform_match_id,
+                                "uploader_uid": uploader_uid,
+                                "upload_mode": mode,
+                                "parse_iteration": parse_iteration,
+                                "is_final": True,
+                            },
+                            finality_status=FINALITY_REVIEWED_MATCH_REFRESHED,
+                            should_settle=True,
+                        )
 
                     await _record_parse_attempt(
                         db,
@@ -2296,13 +2439,17 @@ async def upload_replay_file(
                         played_on=played_on,
                     )
                     await db.commit()
-                    return {
-                        "message": "Reviewed match already stored. Skipped.",
-                        "replay_hash": replay_hash,
-                        "platform_match_id": platform_match_id,
-                        "uploader_uid": uploader_uid,
-                        "upload_mode": mode,
-                    }
+                    return _finality_response(
+                        {
+                            "message": "Reviewed match already stored. Skipped.",
+                            "replay_hash": replay_hash,
+                            "platform_match_id": platform_match_id,
+                            "uploader_uid": uploader_uid,
+                            "upload_mode": mode,
+                        },
+                        finality_status=FINALITY_REVIEWED_MATCH_DUPLICATE,
+                        should_settle=True,
+                    )
 
             if not is_final_upload:
                 existing_live = await db.execute(
@@ -2347,16 +2494,19 @@ async def upload_replay_file(
                             played_on=played_on,
                         )
                         await db.commit()
-                        return {
-                            "message": f"Replay iteration {parse_iteration} parsed and replaced placeholder live session.",
-                            "replay_hash": replay_hash,
-                            "winner": winner,
-                            "players_count": len(players),
-                            "uploader_uid": uploader_uid,
-                            "upload_mode": mode,
-                            "parse_iteration": parse_iteration,
-                            "is_final": False,
-                        }
+                        return _finality_response(
+                            {
+                                "message": f"Replay iteration {parse_iteration} parsed and replaced placeholder live session.",
+                                "replay_hash": replay_hash,
+                                "winner": winner,
+                                "players_count": len(players),
+                                "uploader_uid": uploader_uid,
+                                "upload_mode": mode,
+                                "parse_iteration": parse_iteration,
+                                "is_final": False,
+                            },
+                            finality_status=FINALITY_LIVE,
+                        )
 
                     await _record_parse_attempt(
                         db,
@@ -2372,13 +2522,16 @@ async def upload_replay_file(
                         played_on=played_on,
                     )
                     await db.commit()
-                    return {
-                        "message": "Replay iteration already stored. Skipped.",
-                        "replay_hash": replay_hash,
-                        "uploader_uid": uploader_uid,
-                        "upload_mode": mode,
-                        "parse_iteration": existing_live_game.parse_iteration,
-                    }
+                    return _finality_response(
+                        {
+                            "message": "Replay iteration already stored. Skipped.",
+                            "replay_hash": replay_hash,
+                            "uploader_uid": uploader_uid,
+                            "upload_mode": mode,
+                            "parse_iteration": existing_live_game.parse_iteration,
+                        },
+                        finality_status=FINALITY_LIVE,
+                    )
 
             previous_versions = []
             if is_final_upload and original_name and uploader_uid and uploader_uid != "system":
@@ -2449,16 +2602,20 @@ async def upload_replay_file(
             )
             await db.commit()
 
-        return {
-            "message": "Replay parsed and stored" if is_final_upload else f"Replay iteration {parse_iteration} stored",
-            "replay_hash": replay_hash,
-            "winner": winner,
-            "players_count": len(players),
-            "uploader_uid": uploader_uid,
-            "upload_mode": mode,
-            "parse_iteration": parse_iteration,
-            "is_final": is_final_upload,
-        }
+        return _finality_response(
+            {
+                "message": "Replay parsed and stored" if is_final_upload else f"Replay iteration {parse_iteration} stored",
+                "replay_hash": replay_hash,
+                "winner": winner,
+                "players_count": len(players),
+                "uploader_uid": uploader_uid,
+                "upload_mode": mode,
+                "parse_iteration": parse_iteration,
+                "is_final": is_final_upload,
+            },
+            finality_status=FINALITY_TRUSTED_FINAL if is_final_upload else FINALITY_LIVE,
+            should_settle=is_final_upload,
+        )
     finally:
         try:
             os.remove(temp_path)

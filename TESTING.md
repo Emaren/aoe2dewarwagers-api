@@ -55,14 +55,19 @@ Preferred:
 ```bash
 cd /Users/tonyblum/projects/AoE2DEWarWagers/api-prodn
 source .venv-codex/bin/activate
-pytest -q
+pytest -q tests/test_replay_upload_metadata.py
 ```
 
-Targeted test file:
+Current parity gate:
 
 ```bash
-pytest tests/<file>.py -q
+pytest -q tests/test_replay_upload_metadata.py
+# Expected: 36 passed
 ```
+
+The broad legacy `pytest -q` run is not currently a hard gate. It includes
+upstream parser tests that require the absent `tests/recs/small.mgz` fixture and
+an async test plugin not installed in `.venv-codex`.
 
 ## Replay debugging notes
 
@@ -104,7 +109,7 @@ Before trusting a future test pass, verify:
 Known current problems:
 
 - in the default shell session, `pytest` was not found on PATH
-- the testing workflow is still too implicit
+- the broad legacy suite requires `tests/recs/small.mgz` and an async pytest plugin
 - replay upload/live/final regression coverage should be clearer
 - `tests/test_fast.py` skips missing replay fixtures instead of failing hard; current checked-in fixtures only cover `aoc-1.0.mgx`, `aoc-1.0c.mgx`, and `aok-2.0a.mgl`
 
